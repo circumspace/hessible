@@ -1,0 +1,66 @@
+[versions]
+# Verified live against Google Maven / Maven Central / release notes on 2026-06-21.
+agp = "9.2.0"
+# Must match the Kotlin bundled with AGP 9's built-in Kotlin support (AGP 9.2 → Kotlin 2.3.10).
+kotlin = "2.3.10"
+coreKtx = "1.13.1"
+lifecycle = "2.11.0"
+# activity-compose is NOT managed by the Compose BOM, so it must be pinned explicitly.
+activityCompose = "1.13.0"
+navigationCompose = "2.9.8"
+# Compose BOM manages versions for all androidx.compose.* + lifecycle-*-compose.
+composeBom = "2026.05.00"
+# material3 is pinned ABOVE the BOM to pull the full Material 3 Expressive component set.
+# Bump to 1.5.0 (stable) when released — expected to be a near-no-op (APIs are already API-stable).
+material3 = "1.5.0-alpha22"
+# Quartz (Amethyst's Nostr lib): keys, NIP-19, NIP-44, NIP-55 Android signer.
+quartz = "1.12.6"
+# Coil: image loading (contact photos).
+coil = "3.5.0"
+# OkHttp: WebSocket transport for the Nostr relay protocol.
+okhttp = "5.4.0"
+# ez-vcard: robust vCard (.vcf) read/write for import/export.
+ezvcard = "0.12.2"
+junit = "4.13.2"
+
+[libraries]
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycle" }
+androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigationCompose" }
+
+# BOM (apply as a platform() dependency)
+compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+
+# Versionless — resolved by the Compose BOM
+androidx-ui = { group = "androidx.compose.ui", name = "ui" }
+androidx-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+androidx-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+androidx-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+androidx-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
+
+# Pinned above the BOM for Expressive
+androidx-material3 = { group = "androidx.compose.material3", name = "material3", version.ref = "material3" }
+
+# Nostr
+quartz = { group = "com.vitorpamplona.quartz", name = "quartz-android", version.ref = "quartz" }
+
+# Images
+coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
+coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
+
+# Networking (relay WebSockets)
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+
+# vCard
+ezvcard = { group = "com.googlecode.ez-vcard", name = "ez-vcard", version.ref = "ezvcard" }
+
+# Test
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+# Compose Compiler plugin is still required when buildFeatures.compose = true (even with built-in Kotlin).
+compose-compiler = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

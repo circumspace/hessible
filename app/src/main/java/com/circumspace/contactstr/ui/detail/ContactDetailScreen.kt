@@ -1,0 +1,264 @@
+package com.circumspace.contactstr.ui.detail
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import android.widget.Toast
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.AlternateEmail
+import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.Language
+import androidx.compose.material.icons.filled.Notes
+import androidx.compose.material.icons.filled.Phone
+import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.material.icons.filled.Verified
+import coil3.compose.AsyncImage
+import com.circumspace.contactstr.data.ContactsViewModel
+import com.circumspace.contactstr.data.FavoriteOutcome
+import com.circumspace.contactstr.data.nostr.ProfileViewModel
+import com.circumspace.contactstr.domain.Contact
+import com.circumspace.contactstr.ui.common.LetterAvatar
+import com.circumspace.contactstr.util.dialNumber
+import com.circumspace.contactstr.util.openMap
+import com.circumspace.contactstr.util.openNostr
+import com.circumspace.contactstr.util.openWebsite
+import com.circumspace.contactstr.util.sendEmail
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ContactDetailScreen(
+    contacts: ContactsViewModel,
+    profiles: ProfileViewModel,
+    contactId: String,
+    onEdit: () -> Unit,
+    onBack: () -> Unit,
+) {
+    val list by contacts.contacts.collectAsStateWithLifecycle()
+    val contact = list.firstOrNull { it.id == contactId }
+
+    // Contact was deleted (e.g. from the edit screen) — leave this view.
+    if (contact == null) {
+        LaunchedEffect(Unit) { onBack() }
+        return
+    }
+
+    val context = LocalContext.current
+
+    // Enrich from the linked Nostr profile (non-destructive: fills gaps like the avatar).
+    LaunchedEffect(contact.nostr) {
+        if (contact.nostr.isNotBlank()) profiles.ensureProfile(contact.nostr)
+    }
+    val profileCache by profiles.cache.collectAsStateWithLifecycle()
+    val profile = if (contact.nostr.isNotBlank()) profiles.lookup(profileCache, contact.nostr) else null
+
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        topBar = {
+            TopAppBar(
+                title = {},
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = {
+                        if (contacts.toggleFavorite(setOf(contact.id)) == FavoriteOutcome.EXCEEDS_LIMIT) {
+                            Toast.makeText(
+                                context,
+                                "You can pin up to ${ContactsViewModel.MAX_FAVORITES} favorites",
+                                Toast.LENGTH_SHORT,
+                            ).show()
+                        }
+                    }) {
+                        if (contact.favorite) {
+                            Icon(Icons.Filled.Star, contentDescription = "Unpin from favorites", tint = MaterialTheme.colorScheme.tertiary)
+                        } else {
+                            Icon(Icons.Filled.StarBorder, contentDescription = "Pin to favorites")
+                        }
+                    }
+                    IconButton(onClick = onEdit) {
+                        Icon(Icons.Filled.Edit, contentDescription = "Edit")
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .fillMaxSize(),
+        ) {
+            // Photo header
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp),
+            ) {
+                ContactPhoto(
+                    contact = contact,
+                    profilePicture = profile?.picture?.takeIf { it.isNotBlank() },
+                    size = 132,
+                )
+                Text(
+                    contact.displayName,
+                    style = MaterialTheme.typography.headlineMedium,
+                    textAlign = TextAlign.Center,
+                )
+            }
+
+            if (contact.phone.isNotBlank()) {
+                ActionRow(
+                    icon = Icons.Filled.Phone,
+                    label = "Phone",
+                    value = contact.phone,
+                    actionIcon = Icons.Filled.Call,
+                    actionDescription = "Call ${contact.displayName}",
+                    onAction = { context.dialNumber(contact.phone) },
+                )
+            }
+            if (contact.email.isNotBlank()) {
+                ActionRow(
+                    icon = Icons.Filled.Email,
+                    label = "Email",
+                    value = contact.email,
+                    actionIcon = Icons.Filled.Email,
+                    actionDescription = "Email ${contact.displayName}",
+                    onAction = { context.sendEmail(contact.email) },
+                )
+            }
+            if (contact.address.isNotBlank()) {
+                LinkRow(
+                    icon = Icons.Filled.Place,
+                    label = "Address · tap to open maps",
+                    value = contact.address,
+                    onClick = { context.openMap(contact.address) },
+                )
+            }
+            if (contact.website.isNotBlank()) {
+                LinkRow(
+                    icon = Icons.Filled.Language,
+                    label = "Website",
+                    value = contact.website,
+                    onClick = { context.openWebsite(contact.website) },
+                )
+            }
+            if (contact.nostr.isNotBlank()) {
+                LinkRow(
+                    icon = Icons.Filled.AlternateEmail,
+                    label = "Nostr · tap to open profile",
+                    value = profile?.name?.takeIf { it.isNotBlank() }?.let { "$it · ${contact.nostr.take(16)}…" }
+                        ?: contact.nostr,
+                    onClick = { context.openNostr(contact.nostr) },
+                )
+            }
+            if (!profile?.nip05.isNullOrBlank()) {
+                ListItem(
+                    leadingContent = { Icon(Icons.Filled.Verified, contentDescription = null, tint = MaterialTheme.colorScheme.primary) },
+                    overlineContent = { Text("Verified (NIP-05)") },
+                    headlineContent = { Text(profile!!.nip05) },
+                )
+            }
+            if (contact.note.isNotBlank()) {
+                ListItem(
+                    leadingContent = { Icon(Icons.Filled.Notes, contentDescription = null) },
+                    overlineContent = { Text("Note") },
+                    headlineContent = { Text(contact.note) },
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContactPhoto(contact: Contact, profilePicture: String?, size: Int) {
+    // Your photo wins; otherwise fall back to the linked Nostr profile's avatar.
+    val url = contact.photoUri ?: profilePicture
+    if (url != null) {
+        AsyncImage(
+            model = url,
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.size(size.dp).clip(CircleShape),
+        )
+    } else {
+        LetterAvatar(seed = contact.displayName, label = contact.initials, size = size)
+    }
+}
+
+/** A field with a trailing action button (call / email). */
+@Composable
+private fun ActionRow(
+    icon: ImageVector,
+    label: String,
+    value: String,
+    actionIcon: ImageVector,
+    actionDescription: String,
+    onAction: () -> Unit,
+) {
+    ListItem(
+        leadingContent = { Icon(icon, contentDescription = null) },
+        overlineContent = { Text(label) },
+        headlineContent = { Text(value) },
+        trailingContent = {
+            IconButton(onClick = onAction) {
+                Icon(actionIcon, contentDescription = actionDescription, tint = MaterialTheme.colorScheme.primary)
+            }
+        },
+    )
+}
+
+/** A whole-row-tappable field that opens an external app (maps / browser / Nostr). */
+@Composable
+private fun LinkRow(
+    icon: ImageVector,
+    label: String,
+    value: String,
+    onClick: () -> Unit,
+) {
+    ListItem(
+        modifier = Modifier.clickable(onClick = onClick),
+        leadingContent = { Icon(icon, contentDescription = null) },
+        overlineContent = { Text(label) },
+        headlineContent = { Text(value) },
+        trailingContent = {
+            Icon(Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+        },
+    )
+}
