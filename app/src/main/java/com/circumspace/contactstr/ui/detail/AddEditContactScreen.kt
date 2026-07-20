@@ -7,17 +7,23 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AlternateEmail
+import androidx.compose.material.icons.filled.Cake
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Email
@@ -27,16 +33,23 @@ import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Verified
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DatePicker
+import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.Icon
+import androidx.compose.material3.InputChip
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberDatePickerState
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -47,10 +60,12 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
@@ -59,16 +74,18 @@ import coil3.compose.AsyncImage
 import com.circumspace.contactstr.data.nostr.ProfileViewModel
 import com.circumspace.contactstr.domain.Contact
 import com.circumspace.contactstr.domain.NostrProfile
+import com.circumspace.contactstr.data.BirthdayDate
 import com.circumspace.contactstr.data.nostr.Nip05Verifier
 import com.circumspace.contactstr.ui.common.LetterAvatar
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun AddEditContactScreen(
     existing: Contact?,
     profiles: ProfileViewModel,
+    suggestedCategories: List<String> = emptyList(),
     onSave: (Contact) -> Unit,
     onDelete: (() -> Unit)? = null,
     onBack: () -> Unit,
@@ -81,6 +98,10 @@ fun AddEditContactScreen(
     var nostr by remember { mutableStateOf(existing?.nostr ?: "") }
     var note by remember { mutableStateOf(existing?.note ?: "") }
     var photoUri by remember { mutableStateOf(existing?.photoUri) }
+    val categories = remember { (existing?.categories ?: emptyList()).toMutableStateList() }
+    var newCategory by remember { mutableStateOf("") }
+    var birthday by remember { mutableStateOf(existing?.birthday) }
+    var showBirthdayPicker by remember { mutableStateOf(false) }
 
     var nostrSuggestions by remember { mutableStateOf<List<NostrProfile>>(emptyList()) }
     var searching by remember { mutableStateOf(false) }
@@ -143,6 +164,8 @@ fun AddEditContactScreen(
                                     nostr = nostr.trim(),
                                     note = note.trim(),
                                     photoUri = photoUri,
+                                    categories = categories.toList(),
+                                    birthday = birthday,
                                 ),
                             )
                         },
@@ -250,6 +273,108 @@ fun AddEditContactScreen(
             }
 
             Field(note, { note = it }, "Note", leading = Icons.Filled.Notes, singleLine = false)
+
+            // ── Birthday: opens a date picker; year is optional ──
+            Text("Birthday", style = MaterialTheme.typography.labelLarge)
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { showBirthdayPicker = true }) {
+                    Icon(Icons.Filled.Cake, contentDescription = null)
+                    Text("  " + (birthday?.let { BirthdayDate.display(it) } ?: "Add birthday"))
+                }
+                if (birthday != null) {
+                    IconButton(onClick = { birthday = null }) {
+                        Icon(Icons.Filled.Close, contentDescription = "Clear birthday")
+                    }
+                }
+            }
+
+            // ── Categories: assigned chips (tap ✕ to remove), suggestions, and a free-form add ──
+            Text("Categories", style = MaterialTheme.typography.labelLarge)
+            val addCategory = {
+                val clean = newCategory.trim().lowercase()
+                // "nostr" is reserved — it's derived from the Nostr field, never stored.
+                if (clean.isNotEmpty() && clean != Contact.CATEGORY_NOSTR && clean !in categories) {
+                    categories.add(clean)
+                }
+                newCategory = ""
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                categories.forEach { cat ->
+                    InputChip(
+                        selected = true,
+                        onClick = { categories.remove(cat) },
+                        shape = CircleShape,
+                        label = { Text(cat.replaceFirstChar { it.uppercase() }) },
+                        trailingIcon = {
+                            Icon(
+                                Icons.Filled.Close,
+                                contentDescription = "Remove $cat",
+                                modifier = Modifier.size(16.dp),
+                            )
+                        },
+                    )
+                }
+                suggestedCategories.filterNot { it in categories || it == Contact.CATEGORY_NOSTR }
+                    .forEach { cat ->
+                        InputChip(
+                            selected = false,
+                            onClick = { categories.add(cat) },
+                            shape = CircleShape,
+                            label = { Text(cat.replaceFirstChar { it.uppercase() }) },
+                        )
+                    }
+            }
+            OutlinedTextField(
+                value = newCategory,
+                onValueChange = { newCategory = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                shape = CircleShape,
+                placeholder = { Text("Add category") },
+                trailingIcon = {
+                    IconButton(onClick = addCategory, enabled = newCategory.isNotBlank()) {
+                        Icon(Icons.Filled.Add, contentDescription = "Add category")
+                    }
+                },
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { addCategory() }),
+            )
+        }
+    }
+
+    if (showBirthdayPicker) {
+        BirthdayPickerDialog(
+            initial = birthday,
+            onDismiss = { showBirthdayPicker = false },
+            onPick = { birthday = it; showBirthdayPicker = false },
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun BirthdayPickerDialog(initial: String?, onDismiss: () -> Unit, onPick: (String) -> Unit) {
+    val state = rememberDatePickerState(
+        initialSelectedDateMillis = initial?.let { BirthdayDate.toUtcMillisOrNull(it) },
+    )
+    var includeYear by remember { mutableStateOf(initial?.let { BirthdayDate.hasYear(it) } ?: true) }
+    DatePickerDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(
+                enabled = state.selectedDateMillis != null,
+                onClick = { state.selectedDateMillis?.let { onPick(BirthdayDate.fromUtcMillis(it, includeYear)) } },
+            ) { Text("OK") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    ) {
+        DatePicker(state = state, showModeToggle = true)
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(checked = includeYear, onCheckedChange = { includeYear = it })
+            Text("Include year of birth", style = MaterialTheme.typography.bodyMedium)
         }
     }
 }

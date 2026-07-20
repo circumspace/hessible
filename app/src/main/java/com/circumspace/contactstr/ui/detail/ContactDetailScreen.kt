@@ -3,6 +3,7 @@ package com.circumspace.contactstr.ui.detail
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -15,6 +16,7 @@ import android.widget.Toast
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.AlternateEmail
+import androidx.compose.material.icons.filled.Cake
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Email
@@ -22,6 +24,7 @@ import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Notes
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Place
+import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -30,11 +33,22 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.foundation.Image
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.asImageBitmap
+import com.circumspace.contactstr.data.VCardIo
+import com.google.zxing.BarcodeFormat
+import com.journeyapps.barcodescanner.BarcodeEncoder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -46,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.material.icons.filled.Verified
 import coil3.compose.AsyncImage
+import com.circumspace.contactstr.data.BirthdayDate
 import com.circumspace.contactstr.data.ContactsViewModel
 import com.circumspace.contactstr.data.FavoriteOutcome
 import com.circumspace.contactstr.data.nostr.ProfileViewModel
@@ -76,6 +91,7 @@ fun ContactDetailScreen(
     }
 
     val context = LocalContext.current
+    var showQr by remember { mutableStateOf(false) }
 
     // Enrich from the linked Nostr profile (non-destructive: fills gaps like the avatar).
     LaunchedEffect(contact.nostr) {
@@ -95,6 +111,9 @@ fun ContactDetailScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = { showQr = true }) {
+                        Icon(Icons.Filled.QrCode2, contentDescription = "Share as QR code")
+                    }
                     IconButton(onClick = {
                         if (contacts.toggleFavorite(setOf(contact.id)) == FavoriteOutcome.EXCEEDS_LIMIT) {
                             Toast.makeText(
@@ -141,6 +160,23 @@ fun ContactDetailScreen(
                     style = MaterialTheme.typography.headlineMedium,
                     textAlign = TextAlign.Center,
                 )
+                if (contact.categories.isNotEmpty()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        contact.categories.forEach { cat ->
+                            Surface(
+                                shape = CircleShape,
+                                color = MaterialTheme.colorScheme.secondaryContainer,
+                            ) {
+                                Text(
+                                    cat.replaceFirstChar { it.uppercase() },
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                )
+                            }
+                        }
+                    }
+                }
             }
 
             if (contact.phone.isNotBlank()) {
@@ -202,7 +238,47 @@ fun ContactDetailScreen(
                     headlineContent = { Text(contact.note) },
                 )
             }
+
+            if (!contact.birthday.isNullOrBlank()) {
+                ListItem(
+                    leadingContent = { Icon(Icons.Filled.Cake, contentDescription = null) },
+                    overlineContent = { Text("Birthday") },
+                    headlineContent = { Text(BirthdayDate.display(contact.birthday)) },
+                )
+            }
         }
+    }
+
+    if (showQr) {
+        // Standard vCard payload, so any contacts app (not just Hessible) can scan it.
+        val qr = remember(contact) {
+            runCatching {
+                BarcodeEncoder().encodeBitmap(
+                    VCardIo.export(listOf(contact)),
+                    BarcodeFormat.QR_CODE,
+                    720,
+                    720,
+                )
+            }.getOrNull()
+        }
+        AlertDialog(
+            onDismissRequest = { showQr = false },
+            title = { Text(contact.displayName) },
+            text = {
+                if (qr != null) {
+                    Image(
+                        bitmap = qr.asImageBitmap(),
+                        contentDescription = "Contact QR code",
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                } else {
+                    Text("Could not generate QR code for this contact.")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showQr = false }) { Text("Done") }
+            },
+        )
     }
 }
 

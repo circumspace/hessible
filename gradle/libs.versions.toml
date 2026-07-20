@@ -21,6 +21,9 @@ coil = "3.5.0"
 okhttp = "5.4.0"
 # ez-vcard: robust vCard (.vcf) read/write for import/export.
 ezvcard = "0.12.2"
+# zxing: QR generation (core) + camera scan activity (embedded) for contact sharing.
+zxingCore = "3.5.3"
+zxingEmbedded = "4.3.0"
 junit = "4.13.2"
 
 [libraries]
@@ -56,6 +59,10 @@ okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhtt
 
 # vCard
 ezvcard = { group = "com.googlecode.ez-vcard", name = "ez-vcard", version.ref = "ezvcard" }
+
+# QR sharing
+zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
+zxing-embedded = { group = "com.journeyapps", name = "zxing-android-embedded", version.ref = "zxingEmbedded" }
 
 # Test
 junit = { group = "junit", name = "junit", version.ref = "junit" }

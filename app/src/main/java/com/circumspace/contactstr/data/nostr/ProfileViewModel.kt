@@ -8,6 +8,7 @@ import com.circumspace.contactstr.data.SEARCH_RELAYS
 import com.circumspace.contactstr.domain.NostrProfile
 import com.vitorpamplona.quartz.nip19Bech32.decodePublicKeyAsHexOrNull
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -44,6 +45,9 @@ class ProfileViewModel(app: Application) : AndroidViewModel(app) {
     @Volatile
     private var follows: Set<String> = emptySet()
     private var ownerPubkey: String? = null
+
+    /** Pubkey-hexes with an in-flight metadata fetch, so repeated prefetches don't re-query them. */
+    private val inFlightProfiles = mutableSetOf<String>()
 
     /**
      * Sets the active user and fetches their kind-3 follow list (public, no signing) to use as a
@@ -129,15 +133,35 @@ class ProfileViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Fetch & cache the profile for an npub/nprofile if not already cached. */
-    fun ensureProfile(nostrId: String) {
-        val pubKeyHex = decodePublicKeyAsHexOrNull(nostrId.trim()) ?: return
-        if (_cache.value.containsKey(pubKeyHex)) return
+    fun ensureProfile(nostrId: String) = ensureProfiles(listOf(nostrId))
+
+    /**
+     * Fetch & cache profiles for many npub/nprofiles in a *single* multi-author REQ. The contact
+     * list calls this once per list change instead of firing one query per contact — avoiding a
+     * fan-out of concurrent subscriptions (and their per-frame parsing) at startup.
+     */
+    fun ensureProfiles(nostrIds: Collection<String>) {
+        val cached = _cache.value
+        val hexes = nostrIds
+            .mapNotNull { decodePublicKeyAsHexOrNull(it.trim()) }
+            .distinct()
+            .filterNot { cached.containsKey(it) || it in inFlightProfiles }
+        if (hexes.isEmpty()) return
+        inFlightProfiles += hexes
         viewModelScope.launch {
-            val filter = JSONObject()
-                .put("kinds", JSONArray().put(0))
-                .put("authors", JSONArray().put(pubKeyHex))
-                .put("limit", 1)
-            query(filter, metaPool).mapNotNull { NostrProfile.fromEvent(it) }.firstOrNull()?.let { cacheAll(listOf(it)) }
+            try {
+                val authors = JSONArray().apply { hexes.forEach { put(it) } }
+                val filter = JSONObject()
+                    .put("kinds", JSONArray().put(0))
+                    .put("authors", authors)
+                    .put("limit", hexes.size)
+                val profiles = query(filter, metaPool)
+                    .mapNotNull { NostrProfile.fromEvent(it) }
+                    .distinctBy { it.pubKeyHex }
+                cacheAll(profiles)
+            } finally {
+                inFlightProfiles -= hexes.toSet()
+            }
         }
     }
 
@@ -175,7 +199,7 @@ class ProfileViewModel(app: Application) : AndroidViewModel(app) {
         val out = mutableListOf<JSONObject>()
         val done = CompletableDeferred<Unit>()
 
-        val collector = viewModelScope.launch {
+        val collector = viewModelScope.launch(Dispatchers.Default) {
             var graceStarted = false
             pool.incoming.collect { text ->
                 val arr = runCatching { JSONArray(text) }.getOrNull() ?: return@collect

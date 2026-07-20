@@ -22,6 +22,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Download
@@ -62,7 +63,9 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.circumspace.contactstr.crypto.NostrIdentity
+import androidx.compose.foundation.layout.heightIn
 import com.circumspace.contactstr.data.Durability
+import com.circumspace.contactstr.data.PasteImport
 import com.circumspace.contactstr.data.RelayConfig
 import com.circumspace.contactstr.data.VCardIo
 import com.circumspace.contactstr.data.nostr.SyncState
@@ -90,6 +93,7 @@ fun SettingsScreen(
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
     var showWipeConfirm by remember { mutableStateOf(false) }
+    var showPasteDialog by remember { mutableStateOf(false) }
 
     val exporter = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/x-vcard"),
@@ -202,9 +206,14 @@ fun SettingsScreen(
                         Text("  Import")
                     }
                 }
+                OutlinedButton(onClick = { showPasteDialog = true }, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.ContentPaste, contentDescription = null)
+                    Text("  Paste contacts")
+                }
                 Text(
-                    "Export all contacts to a vCard (.vcf) file, or import from one exported by " +
-                        "another app. Imported contacts sync to your relays.",
+                    "Export all contacts to a vCard (.vcf) file, import from one exported by " +
+                        "another app, or paste plain text (one contact per line: name, phone, " +
+                        "email). Imported contacts sync to your relays.",
                     style = MaterialTheme.typography.labelSmall,
                 )
             }
@@ -259,6 +268,100 @@ fun SettingsScreen(
             },
         )
     }
+
+    if (showPasteDialog) {
+        PasteImportDialog(
+            existingNames = contacts.map { it.displayName.trim().lowercase() }.toSet(),
+            onImport = { imported ->
+                onImport(imported)
+                Toast.makeText(context, "Imported ${imported.size} contacts", Toast.LENGTH_SHORT).show()
+                showPasteDialog = false
+            },
+            onDismiss = { showPasteDialog = false },
+        )
+    }
+}
+
+/**
+ * Paste-import: free text in, parsed preview out, nothing imported until confirmed. Duplicate
+ * names (exact match against existing contacts) and unparseable lines are flagged and skipped.
+ */
+@Composable
+private fun PasteImportDialog(
+    existingNames: Set<String>,
+    onImport: (List<Contact>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val clipboard = LocalClipboardManager.current
+    var text by remember { mutableStateOf(clipboard.getText()?.text ?: "") }
+
+    val parsed = remember(text) { PasteImport.parse(text) }
+    val importable = remember(parsed) {
+        parsed.mapNotNull { it.contact }
+            .filterNot { it.displayName.trim().lowercase() in existingNames }
+    }
+    val duplicates = parsed.count {
+        it.contact != null && it.contact.displayName.trim().lowercase() in existingNames
+    }
+    val unparseable = parsed.count { it.contact == null }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Paste contacts") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 96.dp, max = 160.dp),
+                    placeholder = { Text("Anna Schmidt, +49-30-1234567, anna@example.com") },
+                )
+                Text(
+                    "One contact per line: name, phone, email — in any order.",
+                    style = MaterialTheme.typography.labelSmall,
+                )
+                if (parsed.isNotEmpty()) {
+                    Column(
+                        modifier = Modifier.heightIn(max = 180.dp).verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
+                    ) {
+                        importable.forEach { c ->
+                            Text(
+                                "✓ ${c.displayName}" +
+                                    (c.phone.takeIf { it.isNotBlank() }?.let { " · $it" } ?: "") +
+                                    (c.email.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""),
+                                style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                        if (duplicates > 0) {
+                            Text(
+                                "$duplicates already exist — skipped",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (unparseable > 0) {
+                            Text(
+                                "$unparseable line(s) have no name — skipped",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onImport(importable) }, enabled = importable.isNotEmpty()) {
+                Text("Import ${importable.size}")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        },
+    )
 }
 
 @Composable

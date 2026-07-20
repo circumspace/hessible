@@ -19,6 +19,8 @@ object ContactJson {
         put("note", c.note)
         put("photoUri", c.photoUri ?: JSONObject.NULL)
         put("favorite", c.favorite)
+        put("categories", org.json.JSONArray().apply { c.categories.forEach { put(it) } })
+        put("birthday", c.birthday ?: JSONObject.NULL)
     }
 
     fun toJsonString(c: Contact): String = toJsonObject(c).toString()
@@ -34,6 +36,10 @@ object ContactJson {
         note = o.optString("note"),
         photoUri = if (o.isNull("photoUri")) null else o.optString("photoUri").ifEmpty { null },
         favorite = o.optBoolean("favorite", false),
+        categories = o.optJSONArray("categories")?.let { arr ->
+            (0 until arr.length()).mapNotNull { arr.optString(it).takeIf { s -> s.isNotBlank() } }
+        } ?: emptyList(),
+        birthday = if (o.isNull("birthday")) null else o.optString("birthday").ifBlank { null },
     )
 
     fun fromJsonString(s: String): Contact? = runCatching { fromJsonObject(JSONObject(s)) }.getOrNull()

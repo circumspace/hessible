@@ -2,6 +2,7 @@ package com.circumspace.contactstr.ui
 
 import android.app.Activity
 import android.content.Intent
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.FastOutSlowInEasing
@@ -11,10 +12,14 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -25,7 +30,11 @@ import com.vitorpamplona.quartz.nip55AndroidSigner.client.ExternalSignerLogin
 import com.vitorpamplona.quartz.nip55AndroidSigner.client.NostrSignerExternal
 import com.vitorpamplona.quartz.nip55AndroidSigner.client.isExternalSignerInstalled
 import com.circumspace.contactstr.data.ContactsViewModel
+import com.circumspace.contactstr.data.PasteImport
+import com.circumspace.contactstr.data.VCardIo
 import com.circumspace.contactstr.data.nostr.ProfileViewModel
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import com.circumspace.contactstr.session.SessionViewModel
 import com.circumspace.contactstr.ui.about.AboutScreen
 import com.circumspace.contactstr.ui.detail.AddEditContactScreen
@@ -59,6 +68,18 @@ fun ContactstrApp(
     val navController = rememberNavController()
     val identity by session.identity.collectAsStateWithLifecycle()
 
+    // When the app returns to the foreground, nudge the sync outbox — an external signer (Amber)
+    // can only service a signing request while we're foregrounded, so this is where a publish that
+    // couldn't sign in the background finally goes through.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) contacts.retrySync()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     // Load (or clear) the persisted contacts for the active identity and start/stop relay sync.
     LaunchedEffect(identity) {
         val current = identity
@@ -76,6 +97,14 @@ fun ContactstrApp(
     val ownerProfile by profiles.ownerProfile.collectAsStateWithLifecycle()
     val identityPicture = ownerProfile?.picture?.takeIf { it.isNotBlank() }
     val relays by contacts.relays.collectAsStateWithLifecycle()
+    // Stored (non-derived) categories across all contacts — suggestions in the category editor.
+    val suggestedCategories = remember(contactList) {
+        contactList.flatMap { it.categories }
+            .map { it.trim().lowercase() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .sorted()
+    }
 
     // --- Amber / NIP-55 external signer wiring ---
     val context = LocalContext.current
@@ -114,6 +143,29 @@ fun ContactstrApp(
         amberLoginLauncher.launch(ExternalSignerLogin.createIntent(permissions))
     }
 
+    // QR contact import: scan → parse as vCard (falls back to the paste grammar) → upsert.
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val content = result.contents ?: return@rememberLauncherForActivityResult
+        val imported = runCatching { VCardIo.parse(content.byteInputStream()) }
+            .getOrDefault(emptyList())
+            .ifEmpty { PasteImport.parse(content).mapNotNull { it.contact } }
+        imported.forEach { contacts.upsert(it) }
+        Toast.makeText(
+            context,
+            if (imported.isEmpty()) "No contact found in QR code" else "Imported ${imported.size} contact(s)",
+            Toast.LENGTH_SHORT,
+        ).show()
+    }
+    val onScanQr = {
+        scanLauncher.launch(
+            ScanOptions()
+                .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                .setBeepEnabled(false)
+                .setOrientationLocked(false)
+                .setPrompt("Scan a contact QR code"),
+        )
+    }
+
     // Computed ONCE: if it were reactive to `identity`, creating a key would rebuild the nav
     // graph and reset to LIST, skipping the sign-in screen's backup-key dialog. Screen-to-screen
     // movement is driven by explicit navigation (onSignedIn / onSignOut) instead.
@@ -150,6 +202,7 @@ fun ContactstrApp(
                 identityPicture = identityPicture,
                 themeOverride = themeOverride,
                 onCycleTheme = onCycleTheme,
+                onScanQr = onScanQr,
                 onAdd = { navController.navigate(Routes.ADD) },
                 onOpen = { id -> navController.navigate(Routes.detail(id)) },
                 onSettings = { navController.navigate(Routes.SETTINGS) },
@@ -161,6 +214,7 @@ fun ContactstrApp(
             AddEditContactScreen(
                 existing = null,
                 profiles = profiles,
+                suggestedCategories = suggestedCategories,
                 onSave = { contacts.upsert(it); navController.popBackStack() },
                 onBack = { navController.popBackStack() },
             )
@@ -183,6 +237,7 @@ fun ContactstrApp(
             AddEditContactScreen(
                 existing = existing,
                 profiles = profiles,
+                suggestedCategories = suggestedCategories,
                 onSave = { contacts.upsert(it); navController.popBackStack() },
                 // Delete returns all the way to the list (skips the now-stale detail view).
                 onDelete = existing?.let { c ->

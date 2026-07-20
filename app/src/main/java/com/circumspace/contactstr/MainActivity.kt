@@ -26,17 +26,20 @@ import com.circumspace.contactstr.ui.ContactstrApp
 import com.circumspace.contactstr.ui.theme.ContactstrTheme
 
 class MainActivity : ComponentActivity() {
-    private val contactsPermissions = arrayOf(
+    private val runtimePermissions = arrayOf(
         Manifest.permission.READ_CONTACTS,
         Manifest.permission.WRITE_CONTACTS,
+        // For the app-owned "Hessible Birthdays" calendar; denial just skips calendar sync.
+        Manifest.permission.READ_CALENDAR,
+        Manifest.permission.WRITE_CALENDAR,
     )
 
-    private val requestContactsPermissions =
+    private val requestRuntimePermissions =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { /* sync proceeds once granted */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        ensureContactsPermissions()
+        ensureRuntimePermissions()
         enableEdgeToEdge()
         setContent {
             // Activity-scoped so session, contacts, and prefs are shared across destinations.
@@ -72,10 +75,10 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun ensureContactsPermissions() {
-        val missing = contactsPermissions.any {
+    private fun ensureRuntimePermissions() {
+        val missing = runtimePermissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (missing) requestContactsPermissions.launch(contactsPermissions)
+        if (missing.isNotEmpty()) requestRuntimePermissions.launch(missing.toTypedArray())
     }
 }

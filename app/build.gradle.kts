@@ -78,5 +78,9 @@ dependencies {
     // vCard import/export.
     implementation(libs.ezvcard)
 
+    // QR contact sharing: generation (core) + camera scanning (embedded).
+    implementation(libs.zxing.core)
+    implementation(libs.zxing.embedded)
+
     testImplementation(libs.junit)
 }

@@ -1,9 +1,15 @@
 package com.circumspace.contactstr.ui.list
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -15,12 +21,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
@@ -32,8 +43,10 @@ import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
@@ -53,6 +66,7 @@ import androidx.compose.material3.DrawerValue
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -61,7 +75,13 @@ import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
@@ -77,7 +97,56 @@ import com.circumspace.contactstr.domain.Contact
 import com.circumspace.contactstr.domain.NostrProfile
 import com.circumspace.contactstr.ui.common.ContactAvatar
 import com.circumspace.contactstr.ui.common.IdentityAvatar
+import androidx.compose.foundation.layout.offset
+import kotlin.math.roundToInt
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+
+/** Overscroll (px) needed at the top of the list to reveal the search bar. */
+private const val REVEAL_SEARCH_PX = 120f
+
+/**
+ * Overscroll (px) for the second stage (filter chips) — deliberately much larger than
+ * [REVEAL_SEARCH_PX] so a casual pull only opens search and the chips need a clearly
+ * intentional, longer pull.
+ */
+private const val REVEAL_FILTERS_PX = 400f
+
+/** Upward scroll (px) that hides the filter chips, then (on a further scroll) the search bar. */
+private const val HIDE_THRESHOLD_PX = 160f
+
+/** Fraction of each pull that feeds the elastic driver — the rubber-band resistance. */
+private const val OVERSCROLL_DAMPING = 0.35f
+
+/** Cap on the elastic driver so rows can't be spread arbitrarily far. */
+private const val OVERSCROLL_MAX_PX = 240f
+
+/** How many rows take part in the accordion spread (falloff reaches zero here). */
+private const val SPREAD_ROWS = 10
+
+/** Extra gap (px) opened between the top pair of rows at full pull; later gaps shrink to zero. */
+private const val SPREAD_MAX_GAP_PX = 28f
+
+/** A list element: section header or contact row — flat so the spread can use a global index. */
+private sealed interface ListEntry {
+    data class Header(val title: String) : ListEntry
+    data class Row(val contact: com.circumspace.contactstr.domain.Contact) : ListEntry
+}
+
+/**
+ * Cumulative downward shift for the item at [index] while overscrolling: each gap above it opens
+ * by a graduated amount (largest at the top, zero from [SPREAD_ROWS] on), so rows spread apart and
+ * spring back together without any scaling — and index 0 stays put.
+ */
+private fun accordionShift(index: Int, overscroll: Float): Float {
+    if (overscroll <= 0f || index <= 0) return 0f
+    val fraction = (overscroll / OVERSCROLL_MAX_PX).coerceAtMost(1f)
+    var sum = 0f
+    for (gap in 1..index.coerceAtMost(SPREAD_ROWS)) {
+        sum += 1f - gap.toFloat() / SPREAD_ROWS
+    }
+    return fraction * SPREAD_MAX_GAP_PX * sum
+}
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
@@ -88,6 +157,7 @@ fun ContactListScreen(
     identityPicture: String?,
     themeOverride: Boolean?,
     onCycleTheme: () -> Unit,
+    onScanQr: () -> Unit,
     onAdd: () -> Unit,
     onOpen: (String) -> Unit,
     onSettings: () -> Unit,
@@ -102,7 +172,7 @@ fun ContactListScreen(
     // appear in the list. ensureProfile is idempotent + cached, and the list reacts to updates.
     val profileCache by profiles.cache.collectAsStateWithLifecycle()
     LaunchedEffect(list) {
-        list.forEach { if (it.nostr.isNotBlank()) profiles.ensureProfile(it.nostr) }
+        profiles.ensureProfiles(list.mapNotNull { it.nostr.ifBlank { null } })
     }
 
     // Selection mode: long-press a row to enter, tap rows to toggle. Empty == not in selection mode.
@@ -115,6 +185,140 @@ fun ContactListScreen(
     // Back exits selection mode before leaving the screen. Drawer stays openable as usual.
     BackHandler(enabled = selectionMode) { clearSelection() }
 
+    // ── Search & category filters, revealed in two stages by pulling down at the top ──
+    var searchVisible by remember { mutableStateOf(false) }
+    var filtersVisible by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+    val activeFilters = remember { mutableStateMapOf<String, Unit>() }
+    val listState = rememberLazyListState()
+
+    // Elastic overscroll driver (0..OVERSCROLL_MAX_PX). Written *synchronously* during the drag so
+    // every row moves in the same frame as the finger (a coroutine hop here caused rows to lag);
+    // only the release is animated, with a no-overshoot spring for a native decelerate feel.
+    var overscrollPx by remember { mutableFloatStateOf(0f) }
+    var releaseJob by remember { mutableStateOf<Job?>(null) }
+    val relaxSpread = {
+        if (overscrollPx > 0f && releaseJob?.isActive != true) {
+            releaseJob = scope.launch {
+                animate(
+                    initialValue = overscrollPx,
+                    targetValue = 0f,
+                    animationSpec = spring(
+                        dampingRatio = Spring.DampingRatioNoBouncy,
+                        stiffness = Spring.StiffnessMedium,
+                    ),
+                ) { value, _ -> overscrollPx = value }
+            }
+        }
+    }
+
+    // Safety net: if a gesture ends without a fling callback (e.g. intercepted), relax the spread
+    // instead of leaving the rows stuck mid-transition.
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (!scrolling) relaxSpread()
+        }
+    }
+
+    // Pull down at the top: reveal search, then (much further) filters — with a rubber-band feel.
+    // Scroll up: collapse the rubber band, then hide filters, then search (never discarding an
+    // active query or selected filters).
+    val pullToReveal = remember(listState) {
+        object : NestedScrollConnection {
+            private var pulled = 0f  // downward overscroll accumulated (reveal stages)
+            private var raised = 0f  // upward scroll accumulated (hide stages)
+
+            private fun atTop() =
+                listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0
+
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (available.y >= 0) return Offset.Zero
+                pulled = 0f
+                // First, unwind any accordion spread before the list itself scrolls.
+                if (overscrollPx > 0f) {
+                    releaseJob?.cancel()
+                    val next = (overscrollPx + available.y).coerceAtLeast(0f)
+                    val used = next - overscrollPx
+                    overscrollPx = next
+                    return Offset(0f, used)
+                }
+                if (source == NestedScrollSource.UserInput) {
+                    raised += -available.y
+                    if (raised > HIDE_THRESHOLD_PX) {
+                        raised = 0f
+                        if (filtersVisible && activeFilters.isEmpty()) {
+                            filtersVisible = false
+                        } else if (searchVisible && !filtersVisible && query.isBlank() && activeFilters.isEmpty()) {
+                            searchVisible = false
+                        }
+                    }
+                }
+                return Offset.Zero
+            }
+
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (available.y > 0 && atTop()) {
+                    if (source == NestedScrollSource.UserInput) {
+                        raised = 0f
+                        pulled += available.y
+                        if (!searchVisible && pulled > REVEAL_SEARCH_PX) {
+                            pulled = 0f
+                            searchVisible = true
+                        } else if (searchVisible && !filtersVisible && pulled > REVEAL_FILTERS_PX) {
+                            pulled = 0f
+                            filtersVisible = true
+                        }
+                    }
+                    // Accordion spread only once search + filters are fully revealed — mixing it
+                    // with the reveal transitions reads as jank. The delta is still consumed
+                    // during reveal pulls so the platform stretch never fires.
+                    if (searchVisible && filtersVisible) {
+                        releaseJob?.cancel()
+                        overscrollPx = (overscrollPx + available.y * OVERSCROLL_DAMPING)
+                            .coerceAtMost(OVERSCROLL_MAX_PX)
+                    }
+                    return Offset(0f, available.y)
+                }
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                pulled = 0f
+                raised = 0f
+                relaxSpread()
+                return Velocity.Zero
+            }
+        }
+    }
+
+    // Every category present in the contacts (derived "nostr" included), Nostr suggested first.
+    val allCategories = remember(list) {
+        val cats = list.flatMap { it.effectiveCategories }.distinct().sorted()
+        listOfNotNull(Contact.CATEGORY_NOSTR.takeIf { it in cats }) + cats.filterNot { it == Contact.CATEGORY_NOSTR }
+    }
+
+    // Apply search + category filters (OR across selected categories).
+    val visibleList = remember(list, query, activeFilters.keys.toSet()) {
+        list.filter { c ->
+            val q = query.trim().lowercase()
+            val matchesQuery = q.isEmpty() ||
+                c.displayName.lowercase().contains(q) ||
+                c.phone.lowercase().contains(q) ||
+                c.email.lowercase().contains(q)
+            val matchesFilter = activeFilters.isEmpty() ||
+                c.effectiveCategories.any { it in activeFilters }
+            matchesQuery && matchesFilter
+        }
+    }
+
+    val closeSearch = {
+        searchVisible = false
+        filtersVisible = false
+        query = ""
+        activeFilters.clear()
+    }
+    BackHandler(enabled = searchVisible && !selectionMode) { closeSearch() }
+
     ModalNavigationDrawer(
         drawerState = drawerState,
         // Don't let an edge-swipe open the drawer while picking contacts.
@@ -126,6 +330,7 @@ fun ContactListScreen(
                     pictureUrl = identityPicture,
                     themeOverride = themeOverride,
                     onCycleTheme = onCycleTheme,
+                    onScanQr = { scope.launch { drawerState.close() }; onScanQr() },
                     onSettings = { scope.launch { drawerState.close() }; onSettings() },
                     onAbout = { scope.launch { drawerState.close() }; onAbout() },
                 )
@@ -227,31 +432,66 @@ fun ContactListScreen(
                 EmptyState(Modifier.padding(padding))
             } else {
                 // Favorites pinned to the top under their own header (cap enforced on write).
-                val favorites = list.filter { it.favorite }.take(ContactsViewModel.MAX_FAVORITES)
-                val others = list.filterNot { it.favorite }
-                LazyColumn(modifier = Modifier.padding(padding).fillMaxSize()) {
-                    if (favorites.isNotEmpty()) {
-                        item(key = "header-favorites") { SectionHeader("Favorites") }
-                        items(favorites, key = { it.id }) { contact ->
-                            ContactRow(
-                                contact = contact,
-                                profilePicture = profilePictureFor(contact, profileCache, profiles),
-                                isSelected = selected.containsKey(contact.id),
-                                onClick = { if (selectionMode) toggle(contact.id) else onOpen(contact.id) },
-                                onLongClick = { toggle(contact.id) },
-                            )
-                        }
-                        item(key = "header-all") { SectionHeader("All contacts") }
-                    }
-                    items(others, key = { it.id }) { contact ->
-                        ContactRow(
-                            contact = contact,
-                            profilePicture = profilePictureFor(contact, profileCache, profiles),
-                            isSelected = selected.containsKey(contact.id),
-                            onClick = { if (selectionMode) toggle(contact.id) else onOpen(contact.id) },
-                            onLongClick = { toggle(contact.id) },
+                val favorites = visibleList.filter { it.favorite }.take(ContactsViewModel.MAX_FAVORITES)
+                val others = visibleList.filterNot { it.favorite }
+                Column(modifier = Modifier.padding(padding).fillMaxSize()) {
+                    AnimatedVisibility(visible = searchVisible) {
+                        SearchFilterRow(
+                            query = query,
+                            onQueryChange = { query = it },
+                            filtersVisible = filtersVisible,
+                            categories = allCategories,
+                            activeFilters = activeFilters,
+                            onClose = closeSearch,
                         )
                     }
+                // Flat entry list so every element has a global index for the graduated spread.
+                val entries = remember(favorites, others) {
+                    buildList {
+                        if (favorites.isNotEmpty()) {
+                            add(ListEntry.Header("Favorites"))
+                            favorites.forEach { add(ListEntry.Row(it)) }
+                            add(ListEntry.Header("All contacts"))
+                        }
+                        others.forEach { add(ListEntry.Row(it)) }
+                    }
+                }
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier
+                        .nestedScroll(pullToReveal)
+                        .fillMaxSize(),
+                ) {
+                    itemsIndexed(
+                        entries,
+                        key = { _, e ->
+                            when (e) {
+                                is ListEntry.Header -> "header-${e.title}"
+                                is ListEntry.Row -> e.contact.id
+                            }
+                        },
+                    ) { index, entry ->
+                        // Accordion spread: placement-only offset (no relayout, no distortion);
+                        // index 0 never moves, keeping the list attached to the search bar.
+                        val spreadModifier = Modifier.offset {
+                            IntOffset(0, accordionShift(index, overscrollPx).roundToInt())
+                        }
+                        when (entry) {
+                            is ListEntry.Header -> Box(spreadModifier) { SectionHeader(entry.title) }
+                            is ListEntry.Row -> Box(spreadModifier) {
+                                ContactRow(
+                                    contact = entry.contact,
+                                    profilePicture = profilePictureFor(entry.contact, profileCache, profiles),
+                                    isSelected = selected.containsKey(entry.contact.id),
+                                    onClick = {
+                                        if (selectionMode) toggle(entry.contact.id) else onOpen(entry.contact.id)
+                                    },
+                                    onLongClick = { toggle(entry.contact.id) },
+                                )
+                            }
+                        }
+                    }
+                }
                 }
             }
         }
@@ -294,6 +534,7 @@ private fun ColumnScope.AppDrawer(
     pictureUrl: String?,
     themeOverride: Boolean?,
     onCycleTheme: () -> Unit,
+    onScanQr: () -> Unit,
     onSettings: () -> Unit,
     onAbout: () -> Unit,
 ) {
@@ -309,6 +550,13 @@ private fun ColumnScope.AppDrawer(
     HorizontalDivider()
     Spacer(Modifier.height(8.dp))
 
+    NavigationDrawerItem(
+        label = { Text("Scan contact QR") },
+        icon = { Icon(Icons.Filled.QrCodeScanner, contentDescription = null) },
+        selected = false,
+        onClick = onScanQr,
+        modifier = Modifier.padding(NavigationDrawerItemDefaults.ItemPadding),
+    )
     NavigationDrawerItem(
         label = { Text("Settings") },
         icon = { Icon(Icons.Filled.Settings, contentDescription = null) },
@@ -375,7 +623,8 @@ private fun ContactRow(
                 ContactAvatar(
                     contact = contact,
                     profilePicture = profilePicture,
-                    highlightNostr = contact.nostr.isNotBlank(),
+                    // Category-driven so highlight rules can become user-configurable later.
+                    highlightNostr = Contact.CATEGORY_NOSTR in contact.effectiveCategories,
                 )
             }
         },
@@ -389,8 +638,65 @@ private fun ContactRow(
         } else {
             ListItemDefaults.colors()
         },
-        modifier = Modifier.combinedClickable(onClick = onClick, onLongClick = onLongClick),
+        // Fixed height (M3 two-line list item): rows never resize when supporting text is absent
+        // or an avatar pops in, so neighbours don't shift during startup.
+        modifier = Modifier
+            .height(CONTACT_ROW_HEIGHT_DP.dp)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick),
     )
+}
+
+/** Uniform contact row height (dp) — the Material 3 two-line list item height. */
+private const val CONTACT_ROW_HEIGHT_DP = 72
+
+/**
+ * Two-stage search revealed by pulling down at the top: stage one is a full-width pill-shaped
+ * search bar (rounded to match the app's circular avatars); pulling further reveals the category
+ * filter chips beneath it, with the suggested "Nostr" chip first. Chips filter with OR semantics.
+ */
+@Composable
+private fun SearchFilterRow(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    filtersVisible: Boolean,
+    categories: List<String>,
+    activeFilters: SnapshotStateMap<String, Unit>,
+    onClose: () -> Unit,
+) {
+    val toggleFilter = { c: String -> if (activeFilters.remove(c) == null) activeFilters[c] = Unit; Unit }
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        OutlinedTextField(
+            value = query,
+            onValueChange = onQueryChange,
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            shape = CircleShape,
+            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
+            trailingIcon = {
+                IconButton(onClick = onClose) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close search")
+                }
+            },
+            placeholder = { Text("Search contacts") },
+        )
+        AnimatedVisibility(visible = filtersVisible) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(categories, key = { it }) { cat ->
+                    FilterChip(
+                        selected = activeFilters.containsKey(cat),
+                        onClick = { toggleFilter(cat) },
+                        shape = CircleShape,
+                        label = {
+                            Text(if (cat == Contact.CATEGORY_NOSTR) "Nostr" else cat.replaceFirstChar { it.uppercase() })
+                        },
+                    )
+                }
+            }
+        }
+    }
 }
 
 /** Resolve a contact's display avatar URL from the fetched Nostr profile cache, if any. */

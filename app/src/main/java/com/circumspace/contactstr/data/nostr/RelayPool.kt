@@ -40,10 +40,21 @@ class RelayPool(private val urls: List<String>) {
     }
 
     fun connect() {
-        urls.forEach { url ->
-            val request = Request.Builder().url(url).build()
-            sockets[url] = client.newWebSocket(request, listener(url))
-        }
+        urls.forEach { url -> open(url) }
+    }
+
+    /**
+     * Revive any relay that isn't currently connected — mobile sockets die on doze / Wi-Fi sleep
+     * and OkHttp doesn't re-open them. Each revived socket's onOpen re-fires [onConnect]
+     * (re-subscribe + flush). No-op for already-connected relays.
+     */
+    fun reconnect() {
+        urls.forEach { url -> if (url !in _connected.value) open(url) }
+    }
+
+    private fun open(url: String) {
+        runCatching { sockets[url]?.cancel() }
+        sockets[url] = client.newWebSocket(Request.Builder().url(url).build(), listener(url))
     }
 
     /** Send a raw message (e.g. an EVENT or REQ frame) to every connected relay. */

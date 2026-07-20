@@ -22,8 +22,15 @@ class ContactsContractHelper(private val context: Context) {
     private val resolver: ContentResolver get() = context.contentResolver
 
     fun upsert(account: Account, contact: Contact) = guard {
-        val rawId = findRawContactId(account, contact.id)
-        if (rawId == null) insert(account, contact) else update(rawId, contact)
+        val fp = fingerprint(contact)
+        val existing = findRawContact(account, contact.id)
+        when {
+            existing == null -> insert(account, contact, fp)
+            // Fingerprint matches what we last wrote — nothing to do. This makes the startup
+            // fullSync near-free instead of delete-and-reinserting every contact's rows.
+            existing.second == fp -> Unit
+            else -> update(existing.first, contact, fp)
+        }
     }
 
     fun delete(account: Account, contactId: String) = guard {
@@ -64,18 +71,29 @@ class ContactsContractHelper(private val context: Context) {
 
     // ── private helpers ──────────────────────────────────────────────────────
 
-    private fun findRawContactId(account: Account, sourceId: String): Long? {
+    private fun findRawContactId(account: Account, sourceId: String): Long? =
+        findRawContact(account, sourceId)?.first
+
+    /** Returns (rawContactId, last-written fingerprint from SYNC1) for [sourceId], or null. */
+    private fun findRawContact(account: Account, sourceId: String): Pair<Long, String?>? {
         val cursor: Cursor = resolver.query(
             RawContacts.CONTENT_URI,
-            arrayOf(RawContacts._ID),
+            arrayOf(RawContacts._ID, RawContacts.SYNC1),
             "${RawContacts.ACCOUNT_TYPE}=? AND ${RawContacts.ACCOUNT_NAME}=? AND ${RawContacts.SOURCE_ID}=?",
             arrayOf(ACCOUNT_TYPE, account.name, sourceId),
             null,
         ) ?: return null
         return cursor.use {
-            if (it.moveToFirst()) it.getLong(0) else null
+            if (it.moveToFirst()) it.getLong(0) to it.getString(1) else null
         }
     }
+
+    /** Stable digest of every field mirrored into ContactsContract; stored in SYNC1 on write. */
+    private fun fingerprint(c: Contact): String =
+        listOf(c.displayName, c.phone, c.email, c.address, c.website, c.note, c.nostr, c.birthday.orEmpty())
+            .joinToString("\u0001")
+            .hashCode()
+            .toString()
 
     private fun fetchExistingSourceIds(account: Account): Set<String> {
         val cursor: Cursor = resolver.query(
@@ -94,23 +112,26 @@ class ContactsContractHelper(private val context: Context) {
         }
     }
 
-    private fun insert(account: Account, contact: Contact) {
-        val ops = buildOps(account, contact, rawContactId = null)
+    private fun insert(account: Account, contact: Contact, fp: String) {
+        val ops = buildOps(account, contact, fp)
         resolver.applyBatch(ContactsContract.AUTHORITY, ArrayList(ops))
     }
 
-    private fun update(rawContactId: Long, contact: Contact) {
+    private fun update(rawContactId: Long, contact: Contact, fp: String) {
         // Delete existing data rows and re-insert; simpler than diffing individual rows.
         resolver.delete(
             ContactsContract.Data.CONTENT_URI,
             "${ContactsContract.Data.RAW_CONTACT_ID}=?",
             arrayOf(rawContactId.toString()),
         )
-        val ops = buildDataOps(rawContactId, contact)
-        resolver.applyBatch(ContactsContract.AUTHORITY, ArrayList(ops))
+        val ops = ArrayList(buildDataOps(rawContactId, contact))
+        ops += ContentProviderOperation.newUpdate(
+            ContentUris.withAppendedId(RawContacts.CONTENT_URI, rawContactId),
+        ).withValue(RawContacts.SYNC1, fp).build()
+        resolver.applyBatch(ContactsContract.AUTHORITY, ops)
     }
 
-    private fun buildOps(account: Account, contact: Contact, rawContactId: Long?): List<ContentProviderOperation> {
+    private fun buildOps(account: Account, contact: Contact, fp: String): List<ContentProviderOperation> {
         val ops = mutableListOf<ContentProviderOperation>()
 
         // RawContact row
@@ -120,6 +141,7 @@ class ContactsContractHelper(private val context: Context) {
             withValue(RawContacts.ACCOUNT_TYPE, ACCOUNT_TYPE)
             withValue(RawContacts.ACCOUNT_NAME, account.name)
             withValue(RawContacts.SOURCE_ID, contact.id)
+            withValue(RawContacts.SYNC1, fp)
         }.build()
 
         // Data rows referencing the just-inserted raw contact (back-reference index 0)
@@ -197,6 +219,16 @@ class ContactsContractHelper(private val context: Context) {
                 withValue(Im.LABEL, "Nostr")
                 withValue(Im.PROTOCOL, Im.PROTOCOL_CUSTOM)
                 withValue(Im.CUSTOM_PROTOCOL, "nostr")
+            }
+        }
+
+        if (!contact.birthday.isNullOrBlank()) {
+            // START_DATE accepts both "YYYY-MM-DD" and year-less "--MM-DD". Google/Samsung Calendar
+            // surface TYPE_BIRTHDAY events automatically; our own calendar (Path B) covers the rest.
+            ops += op {
+                withValue(ContactsContract.Data.MIMETYPE, Event.CONTENT_ITEM_TYPE)
+                withValue(Event.START_DATE, contact.birthday)
+                withValue(Event.TYPE, Event.TYPE_BIRTHDAY)
             }
         }
 

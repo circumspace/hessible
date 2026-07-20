@@ -9,10 +9,14 @@ import com.circumspace.contactstr.data.nostr.LocalRelayProbe
 import com.circumspace.contactstr.data.nostr.SyncManager
 import com.circumspace.contactstr.data.nostr.SyncState
 import com.circumspace.contactstr.data.persistence.ContactStore
+import com.circumspace.contactstr.data.persistence.OutboxStore
 import com.circumspace.contactstr.data.persistence.RelayStore
 import com.circumspace.contactstr.domain.Contact
+import com.circumspace.contactstr.sync.BirthdayCalendarHelper
 import com.circumspace.contactstr.sync.ContactsContractHelper
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -30,10 +34,13 @@ import kotlinx.coroutines.withContext
 class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     private val store = ContactStore(app)
     private val relayStore = RelayStore(app)
+    private val outboxStore = OutboxStore(app)
     private val ccHelper = ContactsContractHelper(app)
+    private val birthdayCalendar = BirthdayCalendarHelper(app)
     private var owner: String? = null
     private var identity: NostrIdentity? = null
     private var sync: SyncManager? = null
+    private var persistJob: Job? = null
 
     private val _contacts = MutableStateFlow<List<Contact>>(emptyList())
     val contacts: StateFlow<List<Contact>> = _contacts.asStateFlow()
@@ -51,15 +58,10 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         owner = ownerPubkey
         this.identity = identity
 
+        // Start empty on first run and let relay sync populate — seeding sample data here was
+        // actively harmful once multi-device sync existed (a reseed could push samples to relays).
         _contacts.value = withContext(Dispatchers.IO) {
-            if (store.exists(ownerPubkey)) {
-                store.load(ownerPubkey).sortedBy { it.displayName.lowercase() }
-            } else {
-                // First run for this identity: seed sample data (temporary, local-only — not published).
-                SampleContacts.generate()
-                    .sortedBy { it.displayName.lowercase() }
-                    .also { store.save(ownerPubkey, it) }
-            }
+            store.load(ownerPubkey).sortedBy { it.displayName.lowercase() }
         }
 
         // Load (or seed) the relay set, then start sync against the enabled relays.
@@ -70,6 +72,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
 
         viewModelScope.launch(Dispatchers.IO) {
             ccHelper.fullSync(account(ownerPubkey), _contacts.value)
+            birthdayCalendar.sync(_contacts.value)
         }
 
         startSync(identity)
@@ -82,6 +85,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         val manager = SyncManager(
             relays = enabledRelayUrls(),
             scope = viewModelScope,
+            outboxStore = outboxStore,
             onRemoteContact = { remote -> mergeRemote(remote) },
             onRemoteDelete = { id -> removeLocal(id) },
         )
@@ -93,6 +97,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     private fun enabledRelayUrls(): List<String> = _relays.value.filter { it.enabled }.map { it.url }
 
     fun closeSession() {
+        persistJob?.cancel()
         sync?.stop()
         sync = null
         owner = null
@@ -154,15 +159,26 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun wipeLocalData() {
         val ownerPubkey = owner ?: return
+        persistJob?.cancel() // don't let a debounced save recreate the file after we delete it
         sync?.stop()
         sync = null
         viewModelScope.launch(Dispatchers.IO) {
             ccHelper.fullSync(account(ownerPubkey), emptyList())
+            birthdayCalendar.sync(emptyList())
             store.delete(ownerPubkey)
+            outboxStore.clear()
         }
         owner = null
         _contacts.value = emptyList()
         _syncState.value = SyncState()
+    }
+
+    /**
+     * On app-foreground: re-establish sync — revive dropped relay sockets, re-pull remote changes,
+     * and flush the outbox (where an external signer like Amber can finally service the request).
+     */
+    fun retrySync() {
+        sync?.resync()
     }
 
     fun get(id: String): Contact? = _contacts.value.firstOrNull { it.id == id }
@@ -172,6 +188,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         persist()
         viewModelScope.launch { sync?.publishContact(contact) }
         owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.upsert(account(it), contact) } }
+        viewModelScope.launch(Dispatchers.IO) { birthdayCalendar.upsertBirthday(contact) }
     }
 
     fun delete(id: String) {
@@ -179,6 +196,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         persist()
         viewModelScope.launch { sync?.publishDeletion(id) }
         owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.delete(account(it), id) } }
+        viewModelScope.launch(Dispatchers.IO) { birthdayCalendar.deleteBirthday(id) }
     }
 
     /**
@@ -219,6 +237,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         owner?.let { o ->
             viewModelScope.launch(Dispatchers.IO) { ids.forEach { ccHelper.delete(account(o), it) } }
         }
+        viewModelScope.launch(Dispatchers.IO) { ids.forEach { birthdayCalendar.deleteBirthday(it) } }
     }
 
     /** Apply a contact received from a relay — update local + disk, but do NOT re-publish. */
@@ -226,12 +245,14 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         _contacts.update { merge(it, remote) }
         persist()
         owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.upsert(account(it), remote) } }
+        viewModelScope.launch(Dispatchers.IO) { birthdayCalendar.upsertBirthday(remote) }
     }
 
     private fun removeLocal(id: String) {
         _contacts.update { list -> list.filterNot { it.id == id } }
         persist()
         owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.delete(account(it), id) } }
+        viewModelScope.launch(Dispatchers.IO) { birthdayCalendar.deleteBirthday(id) }
     }
 
     private fun merge(list: List<Contact>, contact: Contact): List<Contact> {
@@ -240,10 +261,17 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         return merged.sortedBy { it.displayName.lowercase() }
     }
 
+    /**
+     * Debounced local save: rapid changes (notably a startup sync merging many remote contacts)
+     * collapse into a single encrypt + write after the burst settles, instead of one per change.
+     */
     private fun persist() {
         val ownerPubkey = owner ?: return
-        val snapshot = _contacts.value
-        viewModelScope.launch(Dispatchers.IO) { store.save(ownerPubkey, snapshot) }
+        persistJob?.cancel()
+        persistJob = viewModelScope.launch(Dispatchers.IO) {
+            delay(PERSIST_DEBOUNCE_MS)
+            store.save(ownerPubkey, _contacts.value)
+        }
     }
 
     private fun account(pubKeyHex: String) =
@@ -252,6 +280,9 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         /** Max contacts that can be pinned to the Favorites section. */
         const val MAX_FAVORITES = 7
+
+        /** Window to coalesce rapid local saves (e.g. a startup sync burst) into one write. */
+        private const val PERSIST_DEBOUNCE_MS = 400L
     }
 }
 
