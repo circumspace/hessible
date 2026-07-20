@@ -82,5 +82,11 @@ dependencies {
     implementation(libs.zxing.core)
     implementation(libs.zxing.embedded)
 
+    // EXIF orientation for picked contact photos.
+    implementation(libs.androidx.exifinterface)
+
+    // Interactive crop/zoom UI for contact photos.
+    implementation(libs.image.cropper)
+
     testImplementation(libs.junit)
 }

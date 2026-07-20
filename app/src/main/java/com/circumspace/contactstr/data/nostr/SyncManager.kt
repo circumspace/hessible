@@ -4,6 +4,7 @@ import com.circumspace.contactstr.crypto.NostrIdentity
 import com.circumspace.contactstr.data.ContactJson
 import com.circumspace.contactstr.data.persistence.OutboxOp
 import com.circumspace.contactstr.data.persistence.OutboxStore
+import com.circumspace.contactstr.data.persistence.TombstoneStore
 import com.circumspace.contactstr.domain.Contact
 import com.vitorpamplona.quartz.nip01Core.core.Event
 import kotlinx.coroutines.CoroutineScope
@@ -35,6 +36,7 @@ class SyncManager(
     private val relays: List<String>,
     private val scope: CoroutineScope,
     private val outboxStore: OutboxStore,
+    private val tombstoneStore: TombstoneStore,
     private val onRemoteContact: (Contact) -> Unit,
     private val onRemoteDelete: (String) -> Unit,
 ) {
@@ -61,14 +63,22 @@ class SyncManager(
      * contact id -> latest NIP-09 deletion timestamp (epoch seconds). A kind-30078 event for a
      * tombstoned contact is ignored unless it was created strictly after the deletion — this makes
      * deletions stick even when a relay keeps serving the old event or ignores NIP-09.
+     *
+     * Backed by [tombstoneStore] so it survives restarts and relay changes: without durable
+     * tombstones, an acked deletion is forgotten on the next start and a relay that ignored the
+     * kind-5 resurrects the contact on re-subscribe.
      */
     private val tombstones = HashMap<String, Long>()
+    private val tombstonePersistMutex = Mutex() // serializes tombstone file writes
 
     private val _state = MutableStateFlow(SyncState())
     val state: StateFlow<SyncState> = _state.asStateFlow()
 
     fun start(id: NostrIdentity) {
         identity = id
+        // Durable tombstones first: every deletion we've ever observed, so an acked-then-forgotten
+        // delete still suppresses a relay's stale copy on this fresh subscription.
+        synchronized(tombstones) { tombstones.putAll(tombstoneStore.load(id.pubKeyHex)) }
         // Restore intents that never got an OK ack (offline edits, failed signer, process death).
         // Deletion intents re-arm their tombstones so a relay's stale copy can't win the race.
         val restored = outboxStore.load()
@@ -80,6 +90,7 @@ class SyncManager(
                 }
             }
         }
+        persistTombstones()
 
         val p = RelayPool(relays).also { pool = it }
         _state.value = SyncState(
@@ -111,8 +122,31 @@ class SyncManager(
     /** Queue a NIP-09 deletion for [contactId] (durable). Tombstones immediately. */
     fun publishDeletion(contactId: String) {
         val now = nowSec()
-        synchronized(tombstones) { tombstones[contactId] = maxOf(tombstones[contactId] ?: 0L, now) }
+        addTombstone(contactId, now)
         enqueue(OutboxOp(contactId, OutboxOp.Type.DELETE, now, contact = null))
+    }
+
+    /**
+     * Record a deletion durably (in-memory + on disk). Never cleared on ack — that's the point.
+     * Returns true only when this actually advanced the tombstone, so callers can skip redundant
+     * work: on every resync the full kind-5 history replays, and persisting/among-devices-notifying
+     * for an already-known deletion is pure overhead (a real jank source with a large history).
+     */
+    private fun addTombstone(contactId: String, at: Long): Boolean {
+        val changed = synchronized(tombstones) {
+            if (at > (tombstones[contactId] ?: 0L)) { tombstones[contactId] = at; true } else false
+        }
+        if (changed) persistTombstones()
+        return changed
+    }
+
+    private fun persistTombstones() {
+        val owner = identity?.pubKeyHex ?: return
+        scope.launch(Dispatchers.IO) {
+            tombstonePersistMutex.withLock {
+                tombstoneStore.save(owner, synchronized(tombstones) { tombstones.toMap() })
+            }
+        }
     }
 
     /** Re-attempt signing + sending everything in the outbox — call on connect and app-foreground. */
@@ -249,10 +283,10 @@ class SyncManager(
                     if (tag.optString(0) == "a" && tag.optString(1).contains(dTagPrefix)) {
                         val contactId = tag.optString(1).substringAfter(dTagPrefix)
                         if (contactId.isNotEmpty()) {
-                            synchronized(tombstones) {
-                                tombstones[contactId] = maxOf(tombstones[contactId] ?: 0L, createdAt)
-                            }
-                            onRemoteDelete(contactId)
+                            // Persist too: a delete from another device must survive a restart here,
+                            // or this device becomes the one that resurrects the contact. Only act on
+                            // a genuinely new deletion — otherwise every resync re-does 200+ deletes.
+                            if (addTombstone(contactId, createdAt)) onRemoteDelete(contactId)
                         }
                     }
                 }

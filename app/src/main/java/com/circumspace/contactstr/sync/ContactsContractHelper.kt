@@ -34,25 +34,86 @@ class ContactsContractHelper(private val context: Context) {
     }
 
     fun delete(account: Account, contactId: String) = guard {
-        val rawId = findRawContactId(account, contactId) ?: return@guard
+        deleteRawContactsBySource(account, contactId)
+    }
+
+    /**
+     * Messengers this contact is *actually reachable on*, detected via the data rows the messenger
+     * apps write onto the aggregated system contact — they create these only for numbers registered
+     * on their service. This is how the stock Contacts app decides whether to offer "Message on
+     * WhatsApp/Signal/Telegram", and it's far more reliable than "is the app installed". Requires
+     * the contact to be mirrored to system contacts (we do) and the messenger to have synced it.
+     * Returns the data-row id so the caller launches the messenger's own chat via ACTION_VIEW.
+     */
+    fun messengerLinks(account: Account, contactId: String): List<MessengerLink> =
+        runCatching {
+            val aggregateId = aggregatedContactId(account, contactId) ?: return@runCatching emptyList()
+            val byMime = Messenger.entries.associateBy { it.mimeType }
+            val cursor = resolver.query(
+                ContactsContract.Data.CONTENT_URI,
+                arrayOf(ContactsContract.Data._ID, ContactsContract.Data.MIMETYPE),
+                "${ContactsContract.Data.CONTACT_ID}=? AND ${ContactsContract.Data.MIMETYPE} IN (?,?,?)",
+                arrayOf(
+                    aggregateId.toString(),
+                    Messenger.WHATSAPP.mimeType,
+                    Messenger.TELEGRAM.mimeType,
+                    Messenger.SIGNAL.mimeType,
+                ),
+                null,
+            ) ?: return@runCatching emptyList()
+            // One link per messenger (first data row wins), stable order.
+            val out = LinkedHashMap<Messenger, MessengerLink>()
+            cursor.use {
+                while (it.moveToNext()) {
+                    val id = it.getLong(0)
+                    val m = byMime[it.getString(1)] ?: continue
+                    if (m !in out) out[m] = MessengerLink(m, id, m.mimeType)
+                }
+            }
+            out.values.toList()
+        }.getOrDefault(emptyList())
+
+    /** The aggregated Contact id our raw contact belongs to (messenger rows hang off the aggregate). */
+    private fun aggregatedContactId(account: Account, sourceId: String): Long? {
+        val cursor = resolver.query(
+            RawContacts.CONTENT_URI,
+            arrayOf(RawContacts.CONTACT_ID),
+            "${RawContacts.ACCOUNT_TYPE}=? AND ${RawContacts.ACCOUNT_NAME}=? AND " +
+                "${RawContacts.SOURCE_ID}=? AND ${RawContacts.DELETED}=0",
+            arrayOf(ACCOUNT_TYPE, account.name, sourceId),
+            null,
+        ) ?: return null
+        return cursor.use { if (it.moveToFirst()) it.getLong(0) else null }
+    }
+
+    /**
+     * Physically remove EVERY raw-contact row for [sourceId] under this account. Uses the
+     * sync-adapter URI so the provider actually deletes the rows instead of soft-marking them
+     * `DELETED=1` (a plain caller's delete on a sync-account row is retained for the adapter to
+     * upload — ours is a stub, so those would pile up forever). Deletes all matches, so it also
+     * clears any duplicate rows a past idempotency bug created.
+     */
+    private fun deleteRawContactsBySource(account: Account, sourceId: String) {
         resolver.delete(
-            ContentUris.withAppendedId(RawContacts.CONTENT_URI, rawId),
-            null, null,
+            RawContacts.CONTENT_URI.asSyncAdapter(account),
+            "${RawContacts.ACCOUNT_TYPE}=? AND ${RawContacts.ACCOUNT_NAME}=? AND ${RawContacts.SOURCE_ID}=?",
+            arrayOf(ACCOUNT_TYPE, account.name, sourceId),
         )
     }
 
     /**
-     * Reconcile the full [contacts] list against ContactsContract for this account.
-     * Contacts removed from [contacts] are deleted; new/changed ones are upserted.
+     * Reconcile the full [contacts] list against ContactsContract for this account. Beyond deleting
+     * rows for contacts no longer present, this physically purges orphans, duplicates, and
+     * soft-deleted leftovers so the system mirror can't bloat (and self-heals a device that already
+     * accumulated them). Clean, unchanged rows are left untouched via the fingerprint fast-path.
      */
     fun fullSync(account: Account, contacts: List<Contact>) = guard {
-        val existingIds = fetchExistingSourceIds(account)
-        val incomingIds = contacts.map { it.id }.toSet()
-
-        // Delete stale rows
-        (existingIds - incomingIds).forEach { delete(account, it) }
-
-        // Upsert current contacts
+        val incoming = contacts.associateBy { it.id }
+        fetchRawStats(account).forEach { (sourceId, stat) ->
+            if (sourceId !in incoming || stat.count > 1 || stat.anyDeleted) {
+                deleteRawContactsBySource(account, sourceId)
+            }
+        }
         contacts.forEach { upsert(account, it) }
     }
 
@@ -71,20 +132,43 @@ class ContactsContractHelper(private val context: Context) {
 
     // ── private helpers ──────────────────────────────────────────────────────
 
-    private fun findRawContactId(account: Account, sourceId: String): Long? =
-        findRawContact(account, sourceId)?.first
-
-    /** Returns (rawContactId, last-written fingerprint from SYNC1) for [sourceId], or null. */
+    /** Returns (rawContactId, last-written fingerprint from SYNC1) for a *live* [sourceId], or null. */
     private fun findRawContact(account: Account, sourceId: String): Pair<Long, String?>? {
         val cursor: Cursor = resolver.query(
             RawContacts.CONTENT_URI,
             arrayOf(RawContacts._ID, RawContacts.SYNC1),
-            "${RawContacts.ACCOUNT_TYPE}=? AND ${RawContacts.ACCOUNT_NAME}=? AND ${RawContacts.SOURCE_ID}=?",
+            // DELETED=0 only: a soft-deleted leftover must never be treated as the live row, or
+            // upsert would either skip (contact stays hidden) or fork a duplicate.
+            "${RawContacts.ACCOUNT_TYPE}=? AND ${RawContacts.ACCOUNT_NAME}=? AND " +
+                "${RawContacts.SOURCE_ID}=? AND ${RawContacts.DELETED}=0",
             arrayOf(ACCOUNT_TYPE, account.name, sourceId),
             null,
         ) ?: return null
         return cursor.use {
             if (it.moveToFirst()) it.getLong(0) to it.getString(1) else null
+        }
+    }
+
+    private data class RawStat(val count: Int, val anyDeleted: Boolean)
+
+    /** sourceId → (row count, whether any row is soft-deleted) for this account, across all states. */
+    private fun fetchRawStats(account: Account): Map<String, RawStat> {
+        val cursor: Cursor = resolver.query(
+            RawContacts.CONTENT_URI,
+            arrayOf(RawContacts.SOURCE_ID, RawContacts.DELETED),
+            "${RawContacts.ACCOUNT_TYPE}=? AND ${RawContacts.ACCOUNT_NAME}=?",
+            arrayOf(ACCOUNT_TYPE, account.name),
+            null,
+        ) ?: return emptyMap()
+        return cursor.use {
+            val map = HashMap<String, RawStat>()
+            while (it.moveToNext()) {
+                val sourceId = it.getString(0) ?: continue
+                val deleted = it.getInt(1) == 1
+                val prev = map[sourceId]
+                map[sourceId] = RawStat((prev?.count ?: 0) + 1, (prev?.anyDeleted ?: false) || deleted)
+            }
+            map
         }
     }
 
@@ -94,23 +178,6 @@ class ContactsContractHelper(private val context: Context) {
             .joinToString("\u0001")
             .hashCode()
             .toString()
-
-    private fun fetchExistingSourceIds(account: Account): Set<String> {
-        val cursor: Cursor = resolver.query(
-            RawContacts.CONTENT_URI,
-            arrayOf(RawContacts.SOURCE_ID),
-            "${RawContacts.ACCOUNT_TYPE}=? AND ${RawContacts.ACCOUNT_NAME}=? AND ${RawContacts.DELETED}=0",
-            arrayOf(ACCOUNT_TYPE, account.name),
-            null,
-        ) ?: return emptySet()
-        return cursor.use {
-            buildSet {
-                while (it.moveToNext()) {
-                    it.getString(0)?.let { id -> add(id) }
-                }
-            }
-        }
-    }
 
     private fun insert(account: Account, contact: Contact, fp: String) {
         val ops = buildOps(account, contact, fp)
@@ -241,6 +308,16 @@ class ContactsContractHelper(private val context: Context) {
             .appendQueryParameter(RawContacts.ACCOUNT_NAME, account.name)
             .appendQueryParameter(ContactsContract.CALLER_IS_SYNCADAPTER, "true")
             .build()
+
+    /** A messenger a contact is reachable on, with the exact mimetype rows carry in ContactsContract. */
+    enum class Messenger(val label: String, val mimeType: String) {
+        WHATSAPP("WhatsApp", "vnd.android.cursor.item/vnd.com.whatsapp.profile"),
+        TELEGRAM("Telegram", "vnd.android.cursor.item/vnd.org.telegram.messenger.android.profile"),
+        SIGNAL("Signal", "vnd.android.cursor.item/vnd.org.thoughtcrime.securesms.contact"),
+    }
+
+    /** A launchable "message on <app>" action: [dataId] is the ContactsContract Data row to VIEW. */
+    data class MessengerLink(val messenger: Messenger, val dataId: Long, val mimeType: String)
 
     companion object {
         const val ACCOUNT_TYPE = "com.circumspace.contactstr"

@@ -97,6 +97,7 @@ fun ContactstrApp(
     val ownerProfile by profiles.ownerProfile.collectAsStateWithLifecycle()
     val identityPicture = ownerProfile?.picture?.takeIf { it.isNotBlank() }
     val relays by contacts.relays.collectAsStateWithLifecycle()
+    val blossomServers by contacts.blossomServers.collectAsStateWithLifecycle()
     // Stored (non-derived) categories across all contacts — suggestions in the category editor.
     val suggestedCategories = remember(contactList) {
         contactList.flatMap { it.categories }
@@ -137,6 +138,8 @@ fun ContactstrApp(
         val permissions = listOf(
             Permission(CommandType.SIGN_EVENT, 30078),
             Permission(CommandType.SIGN_EVENT, 5),
+            // Blossom photo-upload authorization events (BUD-01), so uploads don't prompt per photo.
+            Permission(CommandType.SIGN_EVENT, 24242),
             Permission(CommandType.NIP44_ENCRYPT),
             Permission(CommandType.NIP44_DECRYPT),
         )
@@ -215,6 +218,7 @@ fun ContactstrApp(
                 existing = null,
                 profiles = profiles,
                 suggestedCategories = suggestedCategories,
+                onUploadPhoto = { uri -> contacts.uploadPhoto(uri) },
                 onSave = { contacts.upsert(it); navController.popBackStack() },
                 onBack = { navController.popBackStack() },
             )
@@ -238,6 +242,7 @@ fun ContactstrApp(
                 existing = existing,
                 profiles = profiles,
                 suggestedCategories = suggestedCategories,
+                onUploadPhoto = { uri -> contacts.uploadPhoto(uri) },
                 onSave = { contacts.upsert(it); navController.popBackStack() },
                 // Delete returns all the way to the list (skips the now-stale detail view).
                 onDelete = existing?.let { c ->
@@ -254,11 +259,14 @@ fun ContactstrApp(
                 syncState = syncState,
                 contacts = contactList,
                 relays = relays,
+                blossomServers = blossomServers,
                 onAddRelay = { contacts.addRelay(it) },
                 onRemoveRelay = { contacts.removeRelay(it) },
                 onToggleRelay = { url, enabled -> contacts.setRelayEnabled(url, enabled) },
                 onSetDurability = { url, d -> contacts.setRelayDurability(url, d) },
                 onDetectLocalRelay = { contacts.detectLocalRelay() },
+                onAddBlossomServer = { contacts.addBlossomServer(it) },
+                onRemoveBlossomServer = { contacts.removeBlossomServer(it) },
                 onImport = { imported -> imported.forEach { contacts.upsert(it) } },
                 onSignOut = {
                     session.signOut()

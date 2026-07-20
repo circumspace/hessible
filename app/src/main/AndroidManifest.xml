@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Required (API 30+) to detect and launch an external NIP-55 signer such as Amber. -->
     <queries>
@@ -72,6 +73,15 @@
             android:authorities="com.circumspace.contactstr.contacts"
             android:exported="false"
             android:syncable="true" />
+
+        <!-- The image cropper's activity is an AppCompatActivity (crashes under our Material3/Compose
+             app theme) whose layout is just the crop view — its crop/rotate buttons live in the
+             action bar. So it needs an AppCompat theme WITH an action bar (not NoActionBar, or the
+             confirm button has nowhere to render). Overrides the library's theme-less declaration. -->
+        <activity
+            android:name="com.canhub.cropper.CropImageActivity"
+            android:theme="@style/Theme.AppCompat.DayNight"
+            tools:replace="android:theme" />
 
     </application>
 

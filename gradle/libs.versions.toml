@@ -24,6 +24,10 @@ ezvcard = "0.12.2"
 # zxing: QR generation (core) + camera scan activity (embedded) for contact sharing.
 zxingCore = "3.5.3"
 zxingEmbedded = "4.3.0"
+# exifinterface: read EXIF orientation so picked photos aren't uploaded sideways.
+exifinterface = "1.4.2"
+# android-image-cropper (vanniktech): interactive crop/zoom UI before a photo is uploaded.
+imageCropper = "4.6.0"
 junit = "4.13.2"
 
 [libraries]
@@ -63,6 +67,12 @@ ezvcard = { group = "com.googlecode.ez-vcard", name = "ez-vcard", version.ref = 
 # QR sharing
 zxing-core = { group = "com.google.zxing", name = "core", version.ref = "zxingCore" }
 zxing-embedded = { group = "com.journeyapps", name = "zxing-android-embedded", version.ref = "zxingEmbedded" }
+
+# EXIF orientation for picked photos
+androidx-exifinterface = { group = "androidx.exifinterface", name = "exifinterface", version.ref = "exifinterface" }
+
+# Interactive image crop/zoom UI
+image-cropper = { group = "com.vanniktech", name = "android-image-cropper", version.ref = "imageCropper" }
 
 # Test
 junit = { group = "junit", name = "junit", version.ref = "junit" }

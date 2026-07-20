@@ -5,9 +5,10 @@ import java.util.UUID
 /**
  * A contact record. Will grow to map losslessly to/from vCard.
  *
- * [photoUri] is a local content/file URI for now. When encrypted relay storage lands, the photo
- * will be encrypted client-side, uploaded to a Blossom / NIP-96 host, and this field will hold the
- * blob URL + decryption key (both inside the already-encrypted contact event).
+ * [photoUri] is a *local* content/file URI — a transient, device-only preview that does not sync
+ * meaningfully across devices. [photo] is the durable, cross-device photo: an encrypted blob on
+ * Blossom whose descriptor rides inside the already-encrypted contact event. When both are set,
+ * [photo] is canonical; [photoUri] lingers only as a fast local preview until display switches over.
  */
 data class Contact(
     val id: String = UUID.randomUUID().toString(),
@@ -20,8 +21,16 @@ data class Contact(
     val nostr: String = "",
     val note: String = "",
     val photoUri: String? = null,
+    /** Encrypted Blossom-hosted photo; canonical and cross-device when present. */
+    val photo: ContactPhoto? = null,
     /** Pinned to the Favorites section at the top of the list. */
     val favorite: Boolean = false,
+    /**
+     * Last local edit time (epoch seconds) — the conflict-resolution clock for sync. A remote copy
+     * is applied only if its [updatedAt] is newer, so two coexisting versions on different relays
+     * converge to the latest edit instead of flip-flopping. 0 for legacy records (pre-dates this).
+     */
+    val updatedAt: Long = 0L,
     /** vCard CATEGORIES — free-form groups like "family" or "work". Stored lowercase-insensitively. */
     val categories: List<String> = emptyList(),
     /**

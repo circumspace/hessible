@@ -14,6 +14,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import android.widget.Toast
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.automirrored.filled.Message
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.AlternateEmail
 import androidx.compose.material.icons.filled.Cake
@@ -27,6 +29,8 @@ import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -43,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.asImageBitmap
@@ -66,11 +71,14 @@ import com.circumspace.contactstr.data.FavoriteOutcome
 import com.circumspace.contactstr.data.nostr.ProfileViewModel
 import com.circumspace.contactstr.domain.Contact
 import com.circumspace.contactstr.ui.common.LetterAvatar
+import com.circumspace.contactstr.sync.ContactsContractHelper
 import com.circumspace.contactstr.util.dialNumber
 import com.circumspace.contactstr.util.openMap
+import com.circumspace.contactstr.util.openMessengerData
 import com.circumspace.contactstr.util.openNostr
 import com.circumspace.contactstr.util.openWebsite
 import com.circumspace.contactstr.util.sendEmail
+import com.circumspace.contactstr.util.sendSms
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -180,14 +188,15 @@ fun ContactDetailScreen(
             }
 
             if (contact.phone.isNotBlank()) {
-                ActionRow(
-                    icon = Icons.Filled.Phone,
-                    label = "Phone",
-                    value = contact.phone,
-                    actionIcon = Icons.Filled.Call,
-                    actionDescription = "Call ${contact.displayName}",
-                    onAction = { context.dialNumber(contact.phone) },
-                )
+                // Resolve reachable messengers off the main thread (a ContactsContract query),
+                // so opening a contact never blocks the UI. Re-runs per contact.
+                val messengerLinks by produceState(
+                    initialValue = emptyList<ContactsContractHelper.MessengerLink>(),
+                    contact.id,
+                ) {
+                    value = contacts.messengerLinks(contact.id)
+                }
+                PhoneSection(contact = contact, messengerLinks = messengerLinks)
             }
             if (contact.email.isNotBlank()) {
                 ActionRow(
@@ -284,17 +293,77 @@ fun ContactDetailScreen(
 
 @Composable
 private fun ContactPhoto(contact: Contact, profilePicture: String?, size: Int) {
-    // Your photo wins; otherwise fall back to the linked Nostr profile's avatar.
-    val url = contact.photoUri ?: profilePicture
-    if (url != null) {
+    // Encrypted Blossom photo wins, then a local preview URI, then the linked Nostr profile's avatar.
+    val model: Any? = contact.photo ?: contact.photoUri ?: profilePicture
+    if (model != null) {
         AsyncImage(
-            model = url,
+            model = model,
             contentDescription = null,
             contentScale = ContentScale.Crop,
             modifier = Modifier.size(size.dp).clip(CircleShape),
         )
     } else {
         LetterAvatar(seed = contact.displayName, label = contact.initials, size = size)
+    }
+}
+
+/**
+ * Phone field with a Call action, then messaging shortcuts: SMS always, plus a chip per messenger
+ * the contact is *actually reachable on* — detected from the data rows WhatsApp / Telegram / Signal
+ * write onto the aggregated system contact (only present for registered numbers). [messengerLinks]
+ * is resolved off the main thread by the caller, so composition never blocks.
+ */
+@Composable
+private fun PhoneSection(
+    contact: Contact,
+    messengerLinks: List<ContactsContractHelper.MessengerLink>,
+) {
+    val context = LocalContext.current
+    ListItem(
+        leadingContent = { Icon(Icons.Filled.Phone, contentDescription = null) },
+        overlineContent = { Text("Phone") },
+        headlineContent = { Text(contact.phone) },
+        trailingContent = {
+            IconButton(onClick = { context.dialNumber(contact.phone) }) {
+                Icon(
+                    Icons.Filled.Call,
+                    contentDescription = "Call ${contact.displayName}",
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            }
+        },
+    )
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            // Align the chips under the headline, past the list item's leading icon column.
+            .padding(start = 56.dp, end = 16.dp, bottom = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        AssistChip(
+            onClick = { context.sendSms(contact.phone) },
+            leadingIcon = {
+                Icon(
+                    Icons.AutoMirrored.Filled.Message,
+                    contentDescription = null,
+                    modifier = Modifier.size(AssistChipDefaults.IconSize),
+                )
+            },
+            label = { Text("SMS") },
+        )
+        messengerLinks.forEach { link ->
+            AssistChip(
+                onClick = { context.openMessengerData(link.dataId, link.mimeType) },
+                leadingIcon = {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Chat,
+                        contentDescription = null,
+                        modifier = Modifier.size(AssistChipDefaults.IconSize),
+                    )
+                },
+                label = { Text(link.messenger.label) },
+            )
+        }
     }
 }
 

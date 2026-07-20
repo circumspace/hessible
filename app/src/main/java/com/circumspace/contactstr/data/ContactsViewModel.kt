@@ -2,16 +2,23 @@ package com.circumspace.contactstr.data
 
 import android.accounts.Account
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.circumspace.contactstr.crypto.ImageCrypto
 import com.circumspace.contactstr.crypto.NostrIdentity
+import com.circumspace.contactstr.data.blob.BlossomBlobStore
+import com.circumspace.contactstr.data.blob.ImageProcessing
 import com.circumspace.contactstr.data.nostr.LocalRelayProbe
 import com.circumspace.contactstr.data.nostr.SyncManager
 import com.circumspace.contactstr.data.nostr.SyncState
+import com.circumspace.contactstr.data.persistence.BlossomServerStore
 import com.circumspace.contactstr.data.persistence.ContactStore
 import com.circumspace.contactstr.data.persistence.OutboxStore
 import com.circumspace.contactstr.data.persistence.RelayStore
+import com.circumspace.contactstr.data.persistence.TombstoneStore
 import com.circumspace.contactstr.domain.Contact
+import com.circumspace.contactstr.domain.ContactPhoto
 import com.circumspace.contactstr.sync.BirthdayCalendarHelper
 import com.circumspace.contactstr.sync.ContactsContractHelper
 import kotlinx.coroutines.Dispatchers
@@ -35,6 +42,9 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     private val store = ContactStore(app)
     private val relayStore = RelayStore(app)
     private val outboxStore = OutboxStore(app)
+    private val tombstoneStore = TombstoneStore(app)
+    private val blossomServerStore = BlossomServerStore(app)
+    private val blobStore = BlossomBlobStore()
     private val ccHelper = ContactsContractHelper(app)
     private val birthdayCalendar = BirthdayCalendarHelper(app)
     private var owner: String? = null
@@ -52,6 +62,10 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     private val _relays = MutableStateFlow<List<RelayConfig>>(emptyList())
     val relays: StateFlow<List<RelayConfig>> = _relays.asStateFlow()
 
+    /** Blossom servers that encrypted contact photos are uploaded to (mirrored across all of them). */
+    private val _blossomServers = MutableStateFlow<List<String>>(emptyList())
+    val blossomServers: StateFlow<List<String>> = _blossomServers.asStateFlow()
+
     suspend fun openFor(identity: NostrIdentity) {
         val ownerPubkey = identity.pubKeyHex
         if (owner == ownerPubkey) return
@@ -60,14 +74,34 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
 
         // Start empty on first run and let relay sync populate — seeding sample data here was
         // actively harmful once multi-device sync existed (a reseed could push samples to relays).
+        // Purge any locally-cached contact that we've since tombstoned: a past bug let a relay's
+        // stale copy resurrect a deleted contact into the local cache, and durable tombstones now
+        // let us sweep those ghosts out on load (and keep them from re-arriving via sync).
         _contacts.value = withContext(Dispatchers.IO) {
-            store.load(ownerPubkey).sortedBy { it.displayName.lowercase() }
+            val loaded = store.load(ownerPubkey)
+            val tombstoned = tombstoneStore.load(ownerPubkey).keys
+            val alive = loaded.filterNot { it.id in tombstoned }
+            if (alive.size != loaded.size) {
+                store.save(ownerPubkey, alive)
+                val account = account(ownerPubkey)
+                loaded.filter { it.id in tombstoned }.forEach { ghost ->
+                    ccHelper.delete(account, ghost.id)
+                    birthdayCalendar.deleteBirthday(ghost.id)
+                }
+            }
+            alive.sortedBy { it.displayName.lowercase() }
         }
 
         // Load (or seed) the relay set, then start sync against the enabled relays.
         _relays.value = withContext(Dispatchers.IO) {
             if (relayStore.exists()) relayStore.load()
             else DEFAULT_RELAY_CONFIGS.also { relayStore.save(it) }
+        }
+
+        // Load (or seed) the Blossom server set for encrypted photo uploads.
+        _blossomServers.value = withContext(Dispatchers.IO) {
+            if (blossomServerStore.exists()) blossomServerStore.load()
+            else BlossomServerStore.DEFAULTS.also { blossomServerStore.save(it) }
         }
 
         viewModelScope.launch(Dispatchers.IO) {
@@ -86,6 +120,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
             relays = enabledRelayUrls(),
             scope = viewModelScope,
             outboxStore = outboxStore,
+            tombstoneStore = tombstoneStore,
             onRemoteContact = { remote -> mergeRemote(remote) },
             onRemoteDelete = { id -> removeLocal(id) },
         )
@@ -152,6 +187,43 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // ── Contact photos (encrypted Blossom blobs) ────────────────────────────────
+
+    /**
+     * Process → encrypt → upload a picked image, returning a [ContactPhoto] descriptor to store on
+     * the contact (which then syncs, encrypted, inside the 30078 event). Returns null if the image
+     * can't be read, no servers are configured, or every server rejected the upload (e.g. offline).
+     * Runs entirely off the main thread.
+     */
+    suspend fun uploadPhoto(uri: Uri): ContactPhoto? {
+        val id = identity ?: return null
+        val servers = _blossomServers.value
+        if (servers.isEmpty()) return null
+        return withContext(Dispatchers.IO) {
+            val plain = ImageProcessing.process(getApplication(), uri) ?: return@withContext null
+            val enc = ImageCrypto.encrypt(plain)
+            val sha = ImageCrypto.sha256Hex(enc.ciphertext)
+            val urls = blobStore.upload(enc.ciphertext, sha, servers, id)
+            if (urls.isEmpty()) return@withContext null
+            ContactPhoto(urls = urls, sha256 = sha, key = enc.keyHex, nonce = enc.nonceHex, mime = ImageProcessing.MIME)
+        }
+    }
+
+    fun addBlossomServer(url: String) {
+        val clean = url.trim().trimEnd('/')
+        if (clean.isBlank() || _blossomServers.value.any { it.equals(clean, ignoreCase = true) }) return
+        updateBlossomServers(_blossomServers.value + clean)
+    }
+
+    fun removeBlossomServer(url: String) {
+        updateBlossomServers(_blossomServers.value.filterNot { it == url })
+    }
+
+    private fun updateBlossomServers(next: List<String>) {
+        _blossomServers.value = next
+        viewModelScope.launch(Dispatchers.IO) { blossomServerStore.save(next) }
+    }
+
     /**
      * Erase this device's local footprint for the active owner: the encrypted on-disk cache and
      * every mirrored row in the system contacts store. Does NOT touch relay-stored events — those
@@ -183,12 +255,20 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun get(id: String): Contact? = _contacts.value.firstOrNull { it.id == id }
 
+    /** Messengers this contact is actually reachable on (via system-contact data rows); off-main. */
+    suspend fun messengerLinks(contactId: String): List<ContactsContractHelper.MessengerLink> {
+        val ownerPubkey = owner ?: return emptyList()
+        return withContext(Dispatchers.IO) { ccHelper.messengerLinks(account(ownerPubkey), contactId) }
+    }
+
     fun upsert(contact: Contact) {
-        _contacts.update { merge(it, contact) }
+        // Stamp the edit time so this version wins conflict resolution over any older relay copy.
+        val stamped = contact.copy(updatedAt = nowSec())
+        _contacts.update { merge(it, stamped) }
         persist()
-        viewModelScope.launch { sync?.publishContact(contact) }
-        owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.upsert(account(it), contact) } }
-        viewModelScope.launch(Dispatchers.IO) { birthdayCalendar.upsertBirthday(contact) }
+        viewModelScope.launch { sync?.publishContact(stamped) }
+        owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.upsert(account(it), stamped) } }
+        viewModelScope.launch(Dispatchers.IO) { birthdayCalendar.upsertBirthday(stamped) }
     }
 
     fun delete(id: String) {
@@ -217,7 +297,8 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        val changed = selected.map { it.copy(favorite = makeFavorite) }
+        val now = nowSec()
+        val changed = selected.map { it.copy(favorite = makeFavorite, updatedAt = now) }
         _contacts.update { current ->
             val byId = changed.associateBy { it.id }
             current.map { byId[it.id] ?: it }.sortedBy { it.displayName.lowercase() }
@@ -242,6 +323,12 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Apply a contact received from a relay — update local + disk, but do NOT re-publish. */
     private fun mergeRemote(remote: Contact) {
+        // Conflict resolution + resync de-churn in one guard: apply a remote copy only when it's
+        // strictly newer than what we hold. This stops the "two versions flip-flop" bug (a stale
+        // relay copy can't overwrite a newer edit) AND skips re-persist/re-mirror I/O when the full
+        // history replays on every foreground resync. Legacy records (updatedAt 0) tie → keep local.
+        val current = _contacts.value.firstOrNull { it.id == remote.id }
+        if (current != null && remote.updatedAt <= current.updatedAt) return
         _contacts.update { merge(it, remote) }
         persist()
         owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.upsert(account(it), remote) } }
@@ -249,6 +336,8 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun removeLocal(id: String) {
+        // Deletions replay on every resync; if it's already gone, launch no I/O and touch no state.
+        if (_contacts.value.none { it.id == id }) return
         _contacts.update { list -> list.filterNot { it.id == id } }
         persist()
         owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.delete(account(it), id) } }
@@ -273,6 +362,8 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
             store.save(ownerPubkey, _contacts.value)
         }
     }
+
+    private fun nowSec() = System.currentTimeMillis() / 1000
 
     private fun account(pubKeyHex: String) =
         Account(pubKeyHex, ContactsContractHelper.ACCOUNT_TYPE)

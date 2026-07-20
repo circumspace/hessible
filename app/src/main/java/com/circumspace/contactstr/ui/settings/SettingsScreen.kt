@@ -80,11 +80,14 @@ fun SettingsScreen(
     syncState: SyncState,
     contacts: List<Contact>,
     relays: List<RelayConfig>,
+    blossomServers: List<String>,
     onAddRelay: (String) -> Unit,
     onRemoveRelay: (String) -> Unit,
     onToggleRelay: (String, Boolean) -> Unit,
     onSetDurability: (String, Durability) -> Unit,
     onDetectLocalRelay: () -> Unit,
+    onAddBlossomServer: (String) -> Unit,
+    onRemoveBlossomServer: (String) -> Unit,
     onImport: (List<Contact>) -> Unit,
     onSignOut: () -> Unit,
     onWipeAndSignOut: () -> Unit,
@@ -183,6 +186,14 @@ fun SettingsScreen(
                     onToggleRelay = onToggleRelay,
                     onSetDurability = onSetDurability,
                     onDetectLocalRelay = onDetectLocalRelay,
+                )
+            }
+
+            Section("Photo storage (Blossom)") {
+                BlossomSection(
+                    servers = blossomServers,
+                    onAddServer = onAddBlossomServer,
+                    onRemoveServer = onRemoveBlossomServer,
                 )
             }
 
@@ -466,6 +477,70 @@ private fun RelaySection(
     Text(
         "“Paid” and “self-hosted” relays are durability hints you set per relay; they help you keep " +
             "contacts on relays that won’t prune. A detected local relay is an on-device backup.",
+        style = MaterialTheme.typography.labelSmall,
+    )
+}
+
+@Composable
+private fun BlossomSection(
+    servers: List<String>,
+    onAddServer: (String) -> Unit,
+    onRemoveServer: (String) -> Unit,
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(vertical = 4.dp)) {
+            if (servers.isEmpty()) {
+                Text(
+                    "No servers — contact photos can't be uploaded until you add one.",
+                    modifier = Modifier.padding(16.dp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            servers.forEach { server ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        server,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = { onRemoveServer(server) }) {
+                        Icon(Icons.Filled.Delete, contentDescription = "Remove server")
+                    }
+                }
+                HorizontalDivider()
+            }
+        }
+    }
+
+    var newUrl by remember { mutableStateOf("") }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        OutlinedTextField(
+            value = newUrl,
+            onValueChange = { newUrl = it },
+            modifier = Modifier.weight(1f),
+            singleLine = true,
+            placeholder = { Text("https://blossom.example.com") },
+            label = { Text("Add server") },
+        )
+        IconButton(onClick = { onAddServer(newUrl); newUrl = "" }, enabled = newUrl.isNotBlank()) {
+            Icon(Icons.Filled.Add, contentDescription = "Add server")
+        }
+    }
+    Text(
+        "Contact photos are downscaled, encrypted on this device, and uploaded to every server " +
+            "here (mirrored for redundancy). Only someone with your key can decrypt them, so a " +
+            "server only ever holds ciphertext. Some servers accept uploads only from their own users.",
         style = MaterialTheme.typography.labelSmall,
     )
 }

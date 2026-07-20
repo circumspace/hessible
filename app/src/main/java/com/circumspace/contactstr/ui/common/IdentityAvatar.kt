@@ -80,11 +80,14 @@ fun ContactAvatar(
     size: Int = 36,
     highlightNostr: Boolean = false,
 ) {
-    val url = contact.photoUri ?: profilePicture
+    // Precedence: the encrypted Blossom photo (canonical/cross-device) → a local preview URI →
+    // the linked Nostr profile's avatar → a deterministic letter avatar. Coil routes the
+    // ContactPhoto to the decrypting fetcher; strings use its default loaders.
+    val model: Any? = contact.photo ?: contact.photoUri ?: profilePicture
     val avatar: @Composable (Modifier) -> Unit = { m ->
-        if (url != null) {
+        if (model != null) {
             AsyncImage(
-                model = url,
+                model = model,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = m.size(size.dp).clip(CircleShape),

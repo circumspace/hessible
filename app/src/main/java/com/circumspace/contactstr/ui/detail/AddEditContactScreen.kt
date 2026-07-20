@@ -1,8 +1,14 @@
 package com.circumspace.contactstr.ui.detail
 
+import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import com.canhub.cropper.CropImageContract
+import com.canhub.cropper.CropImageContractOptions
+import com.canhub.cropper.CropImageOptions
+import com.canhub.cropper.CropImageView
+import com.circumspace.contactstr.data.blob.ImageProcessing
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -59,11 +65,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.toMutableStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -86,10 +94,12 @@ fun AddEditContactScreen(
     existing: Contact?,
     profiles: ProfileViewModel,
     suggestedCategories: List<String> = emptyList(),
+    onUploadPhoto: (suspend (android.net.Uri) -> com.circumspace.contactstr.domain.ContactPhoto?)? = null,
     onSave: (Contact) -> Unit,
     onDelete: (() -> Unit)? = null,
     onBack: () -> Unit,
 ) {
+    val scope = rememberCoroutineScope()
     var name by remember { mutableStateOf(existing?.displayName ?: "") }
     var phone by remember { mutableStateOf(existing?.phone ?: "") }
     var email by remember { mutableStateOf(existing?.email ?: "") }
@@ -97,7 +107,12 @@ fun AddEditContactScreen(
     var website by remember { mutableStateOf(existing?.website ?: "") }
     var nostr by remember { mutableStateOf(existing?.nostr ?: "") }
     var note by remember { mutableStateOf(existing?.note ?: "") }
-    var photoUri by remember { mutableStateOf(existing?.photoUri) }
+    // The encrypted, synced photo (canonical). [localPreview] is the just-picked image shown
+    // instantly while its upload runs; [uploading]/[uploadFailed] drive the picker's feedback.
+    var photo by remember { mutableStateOf(existing?.photo) }
+    var localPreview by remember { mutableStateOf<android.net.Uri?>(null) }
+    var uploading by remember { mutableStateOf(false) }
+    var uploadFailed by remember { mutableStateOf(false) }
     val categories = remember { (existing?.categories ?: emptyList()).toMutableStateList() }
     var newCategory by remember { mutableStateOf("") }
     var birthday by remember { mutableStateOf(existing?.birthday) }
@@ -132,9 +147,76 @@ fun AddEditContactScreen(
         }
     }
 
+    // Show the (cropped) image immediately → encrypt+upload in the background. On success the
+    // durable [photo] descriptor is set; on failure we surface it and keep the letter avatar.
+    val startUpload: (android.net.Uri) -> Unit = { uri ->
+        if (onUploadPhoto != null) {
+            localPreview = uri
+            uploadFailed = false
+            uploading = true
+            scope.launch {
+                val result = runCatching { onUploadPhoto(uri) }.getOrNull()
+                if (result != null) {
+                    photo = result
+                } else {
+                    uploadFailed = true
+                    localPreview = null
+                }
+                uploading = false
+            }
+        }
+    }
+
+    // Skin the (AppCompat) cropper to the app's Material 3 palette by feeding live colors into its
+    // options, so its toolbar/menu/guides match the app and follow dark mode + dynamic color —
+    // no duplicated XML theme. Read here in composable scope; used later in the picker callback.
+    val scheme = MaterialTheme.colorScheme
+    val cropSurface = scheme.surface.toArgb()
+    val cropOnSurface = scheme.onSurface.toArgb()
+    val cropPrimary = scheme.primary.toArgb()
+    val cropScrim = scheme.scrim.copy(alpha = 0.6f).toArgb()
+
+    // Crop step: the picked image goes through a square crop/zoom UI; its output feeds the upload.
+    val cropPhoto = rememberLauncherForActivityResult(CropImageContract()) { result ->
+        if (result.isSuccessful) result.uriContent?.let(startUpload)
+    }
+
+    // Modern system photo picker → hand the chosen image to the cropper.
     val pickPhoto = rememberLauncherForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
-    ) { uri -> if (uri != null) photoUri = uri.toString() }
+    ) { uri ->
+        if (uri != null) {
+            cropPhoto.launch(
+                CropImageContractOptions(
+                    uri = uri,
+                    cropImageOptions = CropImageOptions().apply {
+                        fixAspectRatio = true
+                        aspectRatioX = 1
+                        aspectRatioY = 1
+                        cropShape = CropImageView.CropShape.OVAL
+                        outputCompressFormat = Bitmap.CompressFormat.JPEG
+                        // Cap the cropper's output; ImageProcessing still normalizes to its own size.
+                        outputRequestWidth = ImageProcessing.SIZE
+                        outputRequestHeight = ImageProcessing.SIZE
+                        activityTitle = "Crop photo"
+                        cropMenuCropButtonTitle = "Use photo"
+                        // Match the app's Material 3 colors.
+                        activityBackgroundColor = cropSurface
+                        toolbarColor = cropSurface
+                        toolbarTitleColor = cropOnSurface
+                        toolbarBackButtonColor = cropOnSurface
+                        toolbarTintColor = cropPrimary
+                        activityMenuTextColor = cropPrimary
+                        progressBarColor = cropPrimary
+                        guidelinesColor = cropPrimary
+                        borderLineColor = cropPrimary
+                        borderCornerColor = cropPrimary
+                        backgroundColor = cropScrim
+                    },
+                ),
+            )
+        }
+    }
 
     Scaffold(
         modifier = Modifier.fillMaxWidth(),
@@ -163,7 +245,10 @@ fun AddEditContactScreen(
                                     website = website.trim(),
                                     nostr = nostr.trim(),
                                     note = note.trim(),
-                                    photoUri = photoUri,
+                                    photo = photo,
+                                    // Once a durable encrypted photo exists, drop the non-portable
+                                    // local URI; otherwise keep whatever the contact already had.
+                                    photoUri = if (photo != null) null else existing?.photoUri,
                                     categories = categories.toList(),
                                     birthday = birthday,
                                 ),
@@ -197,10 +282,10 @@ fun AddEditContactScreen(
                     },
                 contentAlignment = Alignment.BottomEnd,
             ) {
-                val uri = photoUri
-                if (uri != null) {
+                val model: Any? = localPreview ?: photo ?: existing?.photoUri
+                if (model != null) {
                     AsyncImage(
-                        model = uri,
+                        model = model,
                         contentDescription = "Contact photo",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.size(120.dp).clip(CircleShape),
@@ -212,6 +297,14 @@ fun AddEditContactScreen(
                         size = 120,
                     )
                 }
+                if (uploading) {
+                    Box(
+                        modifier = Modifier.size(120.dp).clip(CircleShape),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        CircularProgressIndicator()
+                    }
+                }
                 Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = CircleShape) {
                     Icon(
                         Icons.Filled.PhotoCamera,
@@ -220,6 +313,13 @@ fun AddEditContactScreen(
                         modifier = Modifier.padding(8.dp),
                     )
                 }
+            }
+            if (uploadFailed) {
+                Text(
+                    "Couldn't upload photo — check your connection or Blossom servers in Settings, then tap to retry.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
             }
 
             Field(name, { name = it }, "Name", capitalization = KeyboardCapitalization.Words)
