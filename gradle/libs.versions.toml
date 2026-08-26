@@ -1,33 +1,33 @@
 [versions]
-# Verified live against Google Maven / Maven Central / release notes on 2026-06-21.
-agp = "9.2.0"
-# Must match the Kotlin bundled with AGP 9's built-in Kotlin support (AGP 9.2 → Kotlin 2.3.10).
+# Verified against Google Maven and Maven Central on 2026-08-25.
+agp = "9.3.2"
+# Quartz uses Kotlin 2.4 metadata, which requires the newer Compose/Kotlin compiler plugin.
 kotlin = "2.3.10"
-coreKtx = "1.13.1"
+coreKtx = "1.19.0"
 lifecycle = "2.11.0"
 # activity-compose is NOT managed by the Compose BOM, so it must be pinned explicitly.
 activityCompose = "1.13.0"
 navigationCompose = "2.9.8"
-# Compose BOM manages versions for all androidx.compose.* + lifecycle-*-compose.
-composeBom = "2026.05.00"
+# Compose BOM manages androidx.compose.*; lifecycle Compose dependencies stay explicit.
+composeBom = "2026.08.00"
 # material3 is pinned ABOVE the BOM to pull the full Material 3 Expressive component set.
-# Bump to 1.5.0 (stable) when released — expected to be a near-no-op (APIs are already API-stable).
-material3 = "1.5.0-alpha22"
+# Keep this on the alpha track until Material 3 Expressive has a stable release.
+material3 = "1.5.0-alpha26"
 # Quartz (Amethyst's Nostr lib): keys, NIP-19, NIP-44, NIP-55 Android signer.
-quartz = "1.12.6"
+quartz = "1.14.0"
 # Coil: image loading (contact photos).
 coil = "3.5.0"
 # OkHttp: WebSocket transport for the Nostr relay protocol.
-okhttp = "5.4.0"
+okhttp = "5.5.0"
 # ez-vcard: robust vCard (.vcf) read/write for import/export.
 ezvcard = "0.12.2"
 # zxing: QR generation (core) + camera scan activity (embedded) for contact sharing.
-zxingCore = "3.5.3"
+zxingCore = "3.5.4"
 zxingEmbedded = "4.3.0"
 # exifinterface: read EXIF orientation so picked photos aren't uploaded sideways.
 exifinterface = "1.4.2"
 # android-image-cropper (vanniktech): interactive crop/zoom UI before a photo is uploaded.
-imageCropper = "4.6.0"
+imageCropper = "4.7.0"
 junit = "4.13.2"
 
 [libraries]

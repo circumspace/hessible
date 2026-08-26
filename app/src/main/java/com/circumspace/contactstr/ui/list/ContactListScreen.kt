@@ -77,6 +77,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.widget.Toast
 import com.circumspace.contactstr.crypto.NostrIdentity
 import com.circumspace.contactstr.data.ContactsViewModel
+import com.circumspace.contactstr.data.ContactListItem
 import com.circumspace.contactstr.data.FavoriteOutcome
 import com.circumspace.contactstr.data.nostr.ProfileViewModel
 import com.circumspace.contactstr.domain.Contact
@@ -88,7 +89,7 @@ import kotlinx.coroutines.launch
 /** A list element: section header or contact row. */
 private sealed interface ListEntry {
     data class Header(val title: String) : ListEntry
-    data class Row(val contact: com.circumspace.contactstr.domain.Contact) : ListEntry
+    data class Row(val item: ContactListItem) : ListEntry
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -106,7 +107,9 @@ fun ContactListScreen(
     onSettings: () -> Unit,
     onAbout: () -> Unit,
 ) {
-    val list by contacts.contacts.collectAsStateWithLifecycle()
+    val listUi by contacts.contactListUi.collectAsStateWithLifecycle()
+    val list = listUi.items
+    val allList = listUi.allItems
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -114,8 +117,8 @@ fun ContactListScreen(
     // Warm the profile cache for any contacts linked to a Nostr identity, so their avatars
     // appear in the list. ensureProfile is idempotent + cached, and the list reacts to updates.
     val profileCache by profiles.cache.collectAsStateWithLifecycle()
-    LaunchedEffect(list) {
-        profiles.ensureProfiles(list.mapNotNull { it.nostr.ifBlank { null } })
+    LaunchedEffect(allList) {
+        profiles.ensureProfiles(allList.map { it.contact.nostr }.filter { it.isNotBlank() })
     }
 
     // Selection mode: long-press a row to enter, tap rows to toggle. Empty == not in selection mode.
@@ -132,26 +135,14 @@ fun ContactListScreen(
     var query by remember { mutableStateOf("") }
     val activeFilters = remember { mutableStateMapOf<String, Unit>() }
     val listState = rememberLazyListState()
+    val activeFilterSet = activeFilters.keys.toSet()
+
+    LaunchedEffect(query, activeFilterSet) {
+        contacts.setListFilters(query, activeFilterSet)
+    }
 
     // Every category present in the contacts (derived "nostr" included), Nostr suggested first.
-    val allCategories = remember(list) {
-        val cats = list.flatMap { it.effectiveCategories }.distinct().sorted()
-        listOfNotNull(Contact.CATEGORY_NOSTR.takeIf { it in cats }) + cats.filterNot { it == Contact.CATEGORY_NOSTR }
-    }
-
-    // Apply search + category filters (OR across selected categories).
-    val visibleList = remember(list, query, activeFilters.keys.toSet()) {
-        list.filter { c ->
-            val q = query.trim().lowercase()
-            val matchesQuery = q.isEmpty() ||
-                c.displayName.lowercase().contains(q) ||
-                c.phone.lowercase().contains(q) ||
-                c.email.lowercase().contains(q)
-            val matchesFilter = activeFilters.isEmpty() ||
-                c.effectiveCategories.any { it in activeFilters }
-            matchesQuery && matchesFilter
-        }
-    }
+    val allCategories = listUi.categories
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -184,10 +175,10 @@ fun ContactListScreen(
                         },
                         actions = {
                             TextButton(onClick = {
-                                if (selected.size == list.size) clearSelection()
-                                else list.forEach { selected[it.id] = Unit }
+                                if (selected.size == allList.size) clearSelection()
+                                else allList.forEach { selected[it.contact.id] = Unit }
                             }) {
-                                Text(if (selected.size == list.size) "None" else "All")
+                                Text(if (selected.size == allList.size) "None" else "All")
                             }
                         },
                     )
@@ -198,10 +189,10 @@ fun ContactListScreen(
                         title = {
                             OutlinedTextField(
                                 value = query,
-                                onValueChange = { query = it },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 4.dp, bottom = 4.dp, end = 8.dp),
+                                 onValueChange = { query = it },
+                                 modifier = Modifier
+                                     .fillMaxWidth()
+                                     .padding(end = 8.dp),
                                 singleLine = true,
                                 shape = CircleShape,
                                 leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
@@ -283,12 +274,12 @@ fun ContactListScreen(
                 }
             },
         ) { padding ->
-            if (list.isEmpty()) {
+            if (allList.isEmpty()) {
                 EmptyState(Modifier.padding(padding))
             } else {
                 // Favorites pinned to the top under their own header (cap enforced on write).
-                val favorites = visibleList.filter { it.favorite }.take(ContactsViewModel.MAX_FAVORITES)
-                val others = visibleList.filterNot { it.favorite }
+                val favorites = list.filter { it.contact.favorite }.take(ContactsViewModel.MAX_FAVORITES)
+                val others = list.filterNot { it.contact.favorite }
                 Column(modifier = Modifier.padding(padding).fillMaxSize()) {
                     if (allCategories.isNotEmpty()) {
                         CategoryFilterRow(categories = allCategories, activeFilters = activeFilters)
@@ -312,20 +303,20 @@ fun ContactListScreen(
                             key = { e ->
                                 when (e) {
                                     is ListEntry.Header -> "header-${e.title}"
-                                    is ListEntry.Row -> e.contact.id
+                                    is ListEntry.Row -> e.item.contact.id
                                 }
                             },
                         ) { entry ->
                             when (entry) {
                                 is ListEntry.Header -> SectionHeader(entry.title)
                                 is ListEntry.Row -> ContactRow(
-                                    contact = entry.contact,
-                                    profilePicture = profilePictureFor(entry.contact, profileCache, profiles),
-                                    isSelected = selected.containsKey(entry.contact.id),
+                                    contact = entry.item.contact,
+                                    profilePicture = profilePictureFor(entry.item, profileCache),
+                                    isSelected = selected.containsKey(entry.item.contact.id),
                                     onClick = {
-                                        if (selectionMode) toggle(entry.contact.id) else onOpen(entry.contact.id)
+                                        if (selectionMode) toggle(entry.item.contact.id) else onOpen(entry.item.contact.id)
                                     },
-                                    onLongClick = { toggle(entry.contact.id) },
+                                    onLongClick = { toggle(entry.item.contact.id) },
                                 )
                             }
                         }
@@ -516,12 +507,10 @@ private fun CategoryFilterRow(
 
 /** Resolve a contact's display avatar URL from the fetched Nostr profile cache, if any. */
 private fun profilePictureFor(
-    contact: Contact,
+    item: ContactListItem,
     cache: Map<String, NostrProfile>,
-    profiles: ProfileViewModel,
 ): String? =
-    if (contact.nostr.isBlank()) null
-    else profiles.lookup(cache, contact.nostr)?.picture?.takeIf { it.isNotBlank() }
+    item.nostrPubKeyHex?.let(cache::get)?.picture?.takeIf { it.isNotBlank() }
 
 @Composable
 private fun SectionHeader(title: String) {

@@ -21,15 +21,40 @@ import com.circumspace.contactstr.domain.Contact
 import com.circumspace.contactstr.domain.ContactPhoto
 import com.circumspace.contactstr.sync.BirthdayCalendarHelper
 import com.circumspace.contactstr.sync.ContactsContractHelper
+import com.vitorpamplona.quartz.nip19Bech32.decodePublicKeyAsHexOrNull
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+
+/** Pre-normalized data required to render and filter a contact-list row. */
+data class ContactListItem(
+    val contact: Contact,
+    val searchableText: String,
+    val categories: Set<String>,
+    val nostrPubKeyHex: String?,
+)
+
+data class ContactListUiState(
+    val allItems: List<ContactListItem> = emptyList(),
+    val items: List<ContactListItem> = emptyList(),
+    val categories: List<String> = emptyList(),
+)
 
 /**
  * Contacts for the signed-in identity: persisted (encrypted) locally per owner and synced with
@@ -47,16 +72,58 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     private val blobStore = BlossomBlobStore()
     private val ccHelper = ContactsContractHelper(app)
     private val birthdayCalendar = BirthdayCalendarHelper(app)
-    private var owner: String? = null
+    @Volatile private var owner: String? = null
     private var identity: NostrIdentity? = null
     private var sync: SyncManager? = null
     private var persistJob: Job? = null
+    private val syncLifecycleMutex = Mutex()
+    private var syncReady = CompletableDeferred(Unit)
 
     private val _contacts = MutableStateFlow<List<Contact>>(emptyList())
     val contacts: StateFlow<List<Contact>> = _contacts.asStateFlow()
+    private val _listQuery = MutableStateFlow("")
+    private val _listFilters = MutableStateFlow<Set<String>>(emptySet())
+    private val allContactListItems: StateFlow<List<ContactListItem>> = contacts
+        .map { list ->
+            withContext(Dispatchers.Default) {
+                val items = list.map { contact ->
+                    ContactListItem(
+                        contact = contact,
+                        searchableText = listOf(contact.displayName, contact.phone, contact.email)
+                            .joinToString("\u0000")
+                            .lowercase(),
+                        categories = contact.effectiveCategories,
+                        nostrPubKeyHex = contact.nostr.takeIf { it.isNotBlank() }
+                            ?.let { decodePublicKeyAsHexOrNull(it.trim()) },
+                    )
+                }
+                items
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    val contactListUi: StateFlow<ContactListUiState> = combine(
+        allContactListItems,
+        _listQuery,
+        _listFilters,
+    ) { allItems, query, filters ->
+        withContext(Dispatchers.Default) {
+            val categories = allItems.flatMap { it.categories }.distinct().sorted()
+            val normalizedQuery = query.trim().lowercase()
+            ContactListUiState(
+                allItems = allItems,
+                items = allItems.filter { item ->
+                    (normalizedQuery.isEmpty() || item.searchableText.contains(normalizedQuery)) &&
+                        (filters.isEmpty() || item.categories.any { it in filters })
+                },
+                categories = listOfNotNull(Contact.CATEGORY_NOSTR.takeIf { it in categories }) +
+                    categories.filterNot { it == Contact.CATEGORY_NOSTR },
+            )
+        }
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, ContactListUiState())
 
     private val _syncState = MutableStateFlow(SyncState())
     val syncState: StateFlow<SyncState> = _syncState.asStateFlow()
+    private var syncStateJob: Job? = null
 
     /** User-managed relay set for the contact data store (URL + enabled + durability hint). */
     private val _relays = MutableStateFlow<List<RelayConfig>>(emptyList())
@@ -71,6 +138,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         if (owner == ownerPubkey) return
         owner = ownerPubkey
         this.identity = identity
+        syncReady = CompletableDeferred()
 
         // Start empty on first run and let relay sync populate — seeding sample data here was
         // actively harmful once multi-device sync existed (a reseed could push samples to relays).
@@ -109,34 +177,71 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
             birthdayCalendar.sync(_contacts.value)
         }
 
-        startSync(identity)
+        try {
+            syncLifecycleMutex.withLock { startSyncLocked(identity) }
+        } finally {
+            syncReady.complete(Unit)
+        }
         detectLocalRelay()
     }
 
     /** (Re)start relay sync against the currently-enabled relays. */
-    private fun startSync(identity: NostrIdentity) {
+    private suspend fun startSyncLocked(identity: NostrIdentity, reseed: Boolean = false) {
+        syncStateJob?.cancelAndJoin()
+        syncStateJob = null
         sync?.stop()
+        sync = null
+        _syncState.value = SyncState()
+        if (owner != identity.pubKeyHex) return
+
         val manager = SyncManager(
             relays = enabledRelayUrls(),
             scope = viewModelScope,
             outboxStore = outboxStore,
             tombstoneStore = tombstoneStore,
-            onRemoteContact = { remote -> mergeRemote(remote) },
-            onRemoteDelete = { id -> removeLocal(id) },
+            onRemoteContact = { remote -> if (owner == identity.pubKeyHex) mergeRemote(remote) },
+            onRemoteDelete = { id -> if (owner == identity.pubKeyHex) removeLocal(id) },
         )
+        try {
+            manager.start(identity)
+        } catch (failure: Throwable) {
+            withContext(NonCancellable) { manager.stop() }
+            throw failure
+        }
+        if (owner != identity.pubKeyHex) {
+            manager.stop()
+            return
+        }
+
         sync = manager
-        viewModelScope.launch { manager.state.collect { _syncState.value = it } }
-        manager.start(identity)
+        syncStateJob = viewModelScope.launch { manager.state.collect { _syncState.value = it } }
+        if (reseed) _contacts.value.forEach(manager::publishContact)
     }
 
     private fun enabledRelayUrls(): List<String> = _relays.value.filter { it.enabled }.map { it.url }
 
-    fun closeSession() {
-        persistJob?.cancel()
-        sync?.stop()
-        sync = null
+    fun setListFilters(query: String, categories: Set<String>) {
+        _listQuery.value = query
+        _listFilters.value = categories
+    }
+
+    suspend fun closeSession() {
+        val closingOwner = owner
         owner = null
         identity = null
+        syncReady.complete(Unit)
+        persistJob?.cancelAndJoin()
+        persistJob = null
+        syncLifecycleMutex.withLock {
+            syncStateJob?.cancelAndJoin()
+            syncStateJob = null
+            sync?.stop()
+            sync = null
+        }
+        if (closingOwner != null) {
+            val snapshot = _contacts.value
+            withContext(Dispatchers.IO) { store.save(closingOwner, snapshot) }
+        }
         _contacts.value = emptyList()
         _relays.value = emptyList()
         _syncState.value = SyncState()
@@ -180,10 +285,13 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     private fun updateRelays(next: List<RelayConfig>, reseed: Boolean) {
         _relays.value = next
         viewModelScope.launch(Dispatchers.IO) { relayStore.save(next) }
-        identity?.let {
-            startSync(it)
-            // Push every contact so a newly added/enabled relay ends up with a full copy.
-            if (reseed) viewModelScope.launch { _contacts.value.forEach { c -> sync?.publishContact(c) } }
+        val currentIdentity = identity
+        if (currentIdentity != null) {
+            viewModelScope.launch {
+                syncLifecycleMutex.withLock {
+                    startSyncLocked(currentIdentity, reseed)
+                }
+            }
         }
     }
 
@@ -229,18 +337,25 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
      * every mirrored row in the system contacts store. Does NOT touch relay-stored events — those
      * cannot be guaranteed deleted. Call before signing out.
      */
-    fun wipeLocalData() {
+    suspend fun wipeLocalData() {
         val ownerPubkey = owner ?: return
-        persistJob?.cancel() // don't let a debounced save recreate the file after we delete it
-        sync?.stop()
-        sync = null
-        viewModelScope.launch(Dispatchers.IO) {
+        owner = null
+        identity = null
+        syncReady.complete(Unit)
+        persistJob?.cancelAndJoin() // don't let a debounced save recreate the file after we delete it
+        persistJob = null
+        syncLifecycleMutex.withLock {
+            syncStateJob?.cancelAndJoin()
+            syncStateJob = null
+            sync?.stop()
+            sync = null
+        }
+        withContext(Dispatchers.IO) {
             ccHelper.fullSync(account(ownerPubkey), emptyList())
             birthdayCalendar.sync(emptyList())
             store.delete(ownerPubkey)
             outboxStore.clear()
         }
-        owner = null
         _contacts.value = emptyList()
         _syncState.value = SyncState()
     }
@@ -250,7 +365,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
      * and flush the outbox (where an external signer like Amber can finally service the request).
      */
     fun retrySync() {
-        sync?.resync()
+        withSync { it.resync() }
     }
 
     fun get(id: String): Contact? = _contacts.value.firstOrNull { it.id == id }
@@ -266,15 +381,38 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         val stamped = contact.copy(updatedAt = nowSec())
         _contacts.update { merge(it, stamped) }
         persist()
-        viewModelScope.launch { sync?.publishContact(stamped) }
+        withSync { it.publishContact(stamped) }
         owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.upsert(account(it), stamped) } }
         viewModelScope.launch(Dispatchers.IO) { birthdayCalendar.upsertBirthday(stamped) }
+    }
+
+    /** Import several contacts as one sorted state update and one persistence operation. */
+    suspend fun upsertAll(contacts: List<Contact>): Int {
+        if (contacts.isEmpty()) return 0
+        val currentOwner = owner ?: return 0
+        return viewModelScope.async {
+            val stamped = withContext(Dispatchers.Default) {
+                val now = nowSec()
+                contacts.map { it.copy(updatedAt = now) }
+            }
+            if (owner != currentOwner) return@async 0
+            _contacts.update { current -> mergeAll(current, stamped) }
+            persist()
+            withSync { manager -> stamped.forEach(manager::publishContact) }
+            viewModelScope.launch(Dispatchers.IO) {
+                stamped.forEach { ccHelper.upsert(account(currentOwner), it) }
+            }
+            viewModelScope.launch(Dispatchers.IO) {
+                stamped.forEach { birthdayCalendar.upsertBirthday(it) }
+            }
+            stamped.size
+        }.await()
     }
 
     fun delete(id: String) {
         _contacts.update { list -> list.filterNot { it.id == id } }
         persist()
-        viewModelScope.launch { sync?.publishDeletion(id) }
+        withSync { it.publishDeletion(id) }
         owner?.let { viewModelScope.launch(Dispatchers.IO) { ccHelper.delete(account(it), id) } }
         viewModelScope.launch(Dispatchers.IO) { birthdayCalendar.deleteBirthday(id) }
     }
@@ -304,7 +442,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
             current.map { byId[it.id] ?: it }.sortedBy { it.displayName.lowercase() }
         }
         persist()
-        viewModelScope.launch { changed.forEach { sync?.publishContact(it) } }
+        withSync { manager -> changed.forEach(manager::publishContact) }
         owner?.let { o -> viewModelScope.launch(Dispatchers.IO) { changed.forEach { ccHelper.upsert(account(o), it) } } }
         return if (makeFavorite) FavoriteOutcome.FAVORITED else FavoriteOutcome.UNFAVORITED
     }
@@ -314,7 +452,7 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         if (ids.isEmpty()) return
         _contacts.update { list -> list.filterNot { it.id in ids } }
         persist()
-        viewModelScope.launch { ids.forEach { sync?.publishDeletion(it) } }
+        withSync { manager -> ids.forEach(manager::publishDeletion) }
         owner?.let { o ->
             viewModelScope.launch(Dispatchers.IO) { ids.forEach { ccHelper.delete(account(o), it) } }
         }
@@ -348,6 +486,23 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
         val idx = list.indexOfFirst { it.id == contact.id }
         val merged = if (idx >= 0) list.toMutableList().also { it[idx] = contact } else list + contact
         return merged.sortedBy { it.displayName.lowercase() }
+    }
+
+    private fun mergeAll(list: List<Contact>, contacts: List<Contact>): List<Contact> {
+        val merged = list.associateByTo(LinkedHashMap()) { it.id }
+        contacts.forEach { merged[it.id] = it }
+        return merged.values.sortedBy { it.displayName.lowercase() }
+    }
+
+    private fun withSync(action: (SyncManager) -> Unit) {
+        val expectedOwner = owner ?: return
+        val ready = syncReady
+        viewModelScope.launch {
+            ready.await()
+            syncLifecycleMutex.withLock {
+                if (owner == expectedOwner) sync?.let(action)
+            }
+        }
     }
 
     /**

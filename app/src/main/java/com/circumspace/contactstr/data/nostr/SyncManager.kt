@@ -9,15 +9,20 @@ import com.circumspace.contactstr.domain.Contact
 import com.vitorpamplona.quartz.nip01Core.core.Event
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Syncs contacts with relays:
@@ -34,7 +39,7 @@ import org.json.JSONObject
  */
 class SyncManager(
     private val relays: List<String>,
-    private val scope: CoroutineScope,
+    scope: CoroutineScope,
     private val outboxStore: OutboxStore,
     private val tombstoneStore: TombstoneStore,
     private val onRemoteContact: (Contact) -> Unit,
@@ -47,11 +52,15 @@ class SyncManager(
 
     private var pool: RelayPool? = null
     private var identity: NostrIdentity? = null
+    private val lifetimeJob = SupervisorJob(scope.coroutineContext[Job])
+    private val lifetimeScope = CoroutineScope(scope.coroutineContext + lifetimeJob)
+    private val storageJob = SupervisorJob(scope.coroutineContext[Job])
+    private val storageScope = CoroutineScope(scope.coroutineContext + storageJob)
+    private val active = AtomicBoolean(false)
 
     /** Pending publish intents, keyed by contact id (latest op per contact wins). */
     private val outbox = LinkedHashMap<String, OutboxOp>()
     private val outboxMutex = Mutex()      // serializes drain() runs
-    private val persistMutex = Mutex()     // serializes outbox file writes (mass-delete bursts)
     /**
      * contact id -> signed wire frame + event id, cached once signed so retries needn't re-sign.
      * Concurrent: written by drain() (Default) and read/removed by onOk() (relay thread) and
@@ -69,24 +78,40 @@ class SyncManager(
      * kind-5 resurrects the contact on re-subscribe.
      */
     private val tombstones = HashMap<String, Long>()
-    private val tombstonePersistMutex = Mutex() // serializes tombstone file writes
+    private val outboxWrites = Channel<Unit>(Channel.CONFLATED)
+    private val tombstoneWrites = Channel<Unit>(Channel.CONFLATED)
+    private val outboxWriter = storageScope.launch(Dispatchers.IO) {
+        for (ignored in outboxWrites) {
+            outboxStore.save(synchronized(outbox) { outbox.values.toList() })
+        }
+    }
+    private val tombstoneWriter = storageScope.launch(Dispatchers.IO) {
+        for (ignored in tombstoneWrites) {
+            val owner = identity?.pubKeyHex ?: continue
+            tombstoneStore.save(owner, synchronized(tombstones) { tombstones.toMap() })
+        }
+    }
 
     private val _state = MutableStateFlow(SyncState())
     val state: StateFlow<SyncState> = _state.asStateFlow()
 
-    fun start(id: NostrIdentity) {
+    suspend fun start(id: NostrIdentity) {
+        check(active.compareAndSet(false, true)) { "SyncManager is already started" }
         identity = id
-        // Durable tombstones first: every deletion we've ever observed, so an acked-then-forgotten
-        // delete still suppresses a relay's stale copy on this fresh subscription.
-        synchronized(tombstones) { tombstones.putAll(tombstoneStore.load(id.pubKeyHex)) }
-        // Restore intents that never got an OK ack (offline edits, failed signer, process death).
-        // Deletion intents re-arm their tombstones so a relay's stale copy can't win the race.
-        val restored = outboxStore.load()
+        val (savedTombstones, restored) = withContext(Dispatchers.IO) {
+            tombstoneStore.load(id.pubKeyHex) to outboxStore.load()
+        }
+        synchronized(tombstones) { tombstones.putAll(savedTombstones) }
         synchronized(outbox) {
             restored.forEach { op ->
                 outbox[op.contactId] = op
                 if (op.type == OutboxOp.Type.DELETE) {
-                    tombstones[op.contactId] = maxOf(tombstones[op.contactId] ?: 0L, op.createdAt)
+                    synchronized(tombstones) {
+                        val previous = tombstones[op.contactId] ?: 0L
+                        if (op.createdAt > previous) {
+                            tombstones[op.contactId] = op.createdAt
+                        }
+                    }
                 }
             }
         }
@@ -96,16 +121,16 @@ class SyncManager(
         _state.value = SyncState(
             relays = relays.map { RelayConn(it, false) },
             syncing = true,
-            pendingWrites = outbox.size,
+            pendingWrites = synchronized(outbox) { outbox.size },
         )
 
-        scope.launch {
+        lifetimeScope.launch {
             p.connected.collect { set ->
                 _state.update { s -> s.copy(relays = relays.map { RelayConn(it, it in set) }) }
             }
         }
         // Parse + decrypt inbound frames off the main thread so a startup sync burst can't jank the list.
-        scope.launch(Dispatchers.Default) { p.incoming.collect { handle(it, id) } }
+        lifetimeScope.launch(Dispatchers.Default) { p.incoming.collect { handle(it, id) } }
 
         p.setOnConnect {
             p.send(reqMessage(id.pubKeyHex))
@@ -116,11 +141,13 @@ class SyncManager(
 
     /** Queue a contact upsert for publishing (durable; signed + sent by [drain]). */
     fun publishContact(contact: Contact) {
+        if (!active.get()) return
         enqueue(OutboxOp(contact.id, OutboxOp.Type.UPSERT, nowSec(), contact))
     }
 
     /** Queue a NIP-09 deletion for [contactId] (durable). Tombstones immediately. */
     fun publishDeletion(contactId: String) {
+        if (!active.get()) return
         val now = nowSec()
         addTombstone(contactId, now)
         enqueue(OutboxOp(contactId, OutboxOp.Type.DELETE, now, contact = null))
@@ -134,24 +161,25 @@ class SyncManager(
      */
     private fun addTombstone(contactId: String, at: Long): Boolean {
         val changed = synchronized(tombstones) {
-            if (at > (tombstones[contactId] ?: 0L)) { tombstones[contactId] = at; true } else false
+            if (at > (tombstones[contactId] ?: 0L)) {
+                tombstones[contactId] = at
+                true
+            } else {
+                false
+            }
         }
         if (changed) persistTombstones()
         return changed
     }
 
     private fun persistTombstones() {
-        val owner = identity?.pubKeyHex ?: return
-        scope.launch(Dispatchers.IO) {
-            tombstonePersistMutex.withLock {
-                tombstoneStore.save(owner, synchronized(tombstones) { tombstones.toMap() })
-            }
-        }
+        tombstoneWrites.trySend(Unit)
     }
 
     /** Re-attempt signing + sending everything in the outbox — call on connect and app-foreground. */
     fun retry() {
-        scope.launch { drain() }
+        if (!active.get()) return
+        lifetimeScope.launch { drain() }
     }
 
     /**
@@ -161,6 +189,7 @@ class SyncManager(
      * outbox. Without this, sync only ever ran from the initial cold-start connect.
      */
     fun resync() {
+        if (!active.get()) return
         val id = identity ?: return
         val p = pool ?: return
         p.reconnect()
@@ -169,9 +198,17 @@ class SyncManager(
         retry()
     }
 
-    fun stop() {
+    suspend fun stop() {
+        active.set(false)
         pool?.close()
         pool = null
+        lifetimeJob.cancelAndJoin()
+        // Closing a channel drains its final conflated snapshot before the writer exits.
+        outboxWrites.close()
+        tombstoneWrites.close()
+        outboxWriter.join()
+        tombstoneWriter.join()
+        storageJob.cancelAndJoin()
         // In-memory only — the persisted outbox survives and reloads on the next start().
         synchronized(outbox) { outbox.clear() }
         signedCache.clear()
@@ -182,6 +219,7 @@ class SyncManager(
     // ── outbox ─────────────────────────────────────────────────────────────────
 
     private fun enqueue(op: OutboxOp) {
+        if (!active.get()) return
         synchronized(outbox) {
             outbox[op.contactId] = op
             signedCache.remove(op.contactId) // intent changed → any cached signature is stale
@@ -192,11 +230,7 @@ class SyncManager(
     }
 
     private fun persistOutbox() {
-        // Serialize writes and snapshot inside the lock so a burst of enqueues can't write the
-        // same file concurrently, and the last write reflects the latest state.
-        scope.launch(Dispatchers.IO) {
-            persistMutex.withLock { outboxStore.save(synchronized(outbox) { outbox.values.toList() }) }
-        }
+        outboxWrites.trySend(Unit)
     }
 
     /** Single-flight: sign (if needed) and send every queued op. Ops that fail to sign stay queued. */
@@ -237,6 +271,7 @@ class SyncManager(
     }
 
     private fun handle(text: String, id: NostrIdentity) {
+        if (!active.get()) return
         val arr = runCatching { JSONArray(text) }.getOrNull() ?: return
         when (arr.optString(0)) {
             "EVENT" -> handleEvent(arr.optJSONObject(2) ?: return, id)
@@ -250,6 +285,7 @@ class SyncManager(
 
     /** An OK for [eventId]: find the outbox op whose cached signature matches, and clear it. */
     private fun onOk(eventId: String) {
+        if (!active.get()) return
         val contactId = signedCache.entries.firstOrNull { it.value.second == eventId }?.key ?: return
         val removed = synchronized(outbox) { outbox.remove(contactId) != null }
         signedCache.remove(contactId)
@@ -263,10 +299,11 @@ class SyncManager(
         when (obj.optInt("kind")) {
             appKind -> {
                 val createdAt = obj.optLong("created_at")
-                scope.launch(Dispatchers.Default) {
+                lifetimeScope.launch(Dispatchers.Default) {
                     val plain = runCatching { id.signer.nip44Decrypt(obj.optString("content"), id.pubKeyHex) }
                         .getOrNull() ?: return@launch
                     ContactJson.fromJsonString(plain)?.let { contact ->
+                        if (!active.get()) return@launch
                         // Ignore events for a deleted contact unless re-created after the deletion.
                         val deletedAt = synchronized(tombstones) { tombstones[contact.id] }
                         if (deletedAt != null && createdAt <= deletedAt) return@launch

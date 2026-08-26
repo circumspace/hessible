@@ -11,11 +11,17 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -41,6 +47,9 @@ import com.circumspace.contactstr.ui.detail.AddEditContactScreen
 import com.circumspace.contactstr.ui.detail.ContactDetailScreen
 import com.circumspace.contactstr.ui.list.ContactListScreen
 import com.circumspace.contactstr.ui.settings.SettingsScreen
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.circumspace.contactstr.ui.signin.SignInScreen
 
 private object Routes {
@@ -67,6 +76,14 @@ fun ContactstrApp(
 ) {
     val navController = rememberNavController()
     val identity by session.identity.collectAsStateWithLifecycle()
+    val restored by session.restored.collectAsStateWithLifecycle()
+
+    if (!restored) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            CircularProgressIndicator()
+        }
+        return
+    }
 
     // When the app returns to the foreground, nudge the sync outbox — an external signer (Amber)
     // can only service a signing request while we're foregrounded, so this is where a publish that
@@ -109,6 +126,7 @@ fun ContactstrApp(
 
     // --- Amber / NIP-55 external signer wiring ---
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val amberAvailable = remember { isExternalSignerInstalled(context) }
 
     // Delivers foreground signer-prompt results back to the active external signer.
@@ -149,15 +167,19 @@ fun ContactstrApp(
     // QR contact import: scan → parse as vCard (falls back to the paste grammar) → upsert.
     val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
         val content = result.contents ?: return@rememberLauncherForActivityResult
-        val imported = runCatching { VCardIo.parse(content.byteInputStream()) }
-            .getOrDefault(emptyList())
-            .ifEmpty { PasteImport.parse(content).mapNotNull { it.contact } }
-        imported.forEach { contacts.upsert(it) }
-        Toast.makeText(
-            context,
-            if (imported.isEmpty()) "No contact found in QR code" else "Imported ${imported.size} contact(s)",
-            Toast.LENGTH_SHORT,
-        ).show()
+        scope.launch {
+            val imported = withContext(Dispatchers.Default) {
+                runCatching { VCardIo.parse(content.byteInputStream()) }
+                    .getOrDefault(emptyList())
+                    .ifEmpty { PasteImport.parse(content).mapNotNull { it.contact } }
+            }
+            val count = contacts.upsertAll(imported)
+            Toast.makeText(
+                context,
+                if (count == 0) "No contact found in QR code" else "Imported $count contact(s)",
+                Toast.LENGTH_SHORT,
+            ).show()
+        }
     }
     val onScanQr = {
         scanLauncher.launch(
@@ -267,17 +289,22 @@ fun ContactstrApp(
                 onDetectLocalRelay = { contacts.detectLocalRelay() },
                 onAddBlossomServer = { contacts.addBlossomServer(it) },
                 onRemoveBlossomServer = { contacts.removeBlossomServer(it) },
-                onImport = { imported -> imported.forEach { contacts.upsert(it) } },
+                onImport = { imported -> contacts.upsertAll(imported) },
                 onSignOut = {
-                    session.signOut()
-                    navController.navigate(Routes.SIGN_IN) { popUpTo(0) }
+                    scope.launch {
+                        contacts.closeSession()
+                        session.signOut()
+                        navController.navigate(Routes.SIGN_IN) { popUpTo(0) }
+                    }
                 },
                 onWipeAndSignOut = {
                     // Erase the device-local footprint first (needs the active owner still set),
                     // then sign out (clears the key and removes the Android account).
-                    contacts.wipeLocalData()
-                    session.signOut()
-                    navController.navigate(Routes.SIGN_IN) { popUpTo(0) }
+                    scope.launch {
+                        contacts.wipeLocalData()
+                        session.signOut()
+                        navController.navigate(Routes.SIGN_IN) { popUpTo(0) }
+                    }
                 },
                 onBack = { navController.popBackStack() },
             )

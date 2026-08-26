@@ -45,12 +45,13 @@ import androidx.compose.material3.DatePicker
 import androidx.compose.material3.DatePickerDialog
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenu
+import androidx.compose.material3.ExposedDropdownMenuAnchorType
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.Icon
 import androidx.compose.material3.InputChip
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -339,7 +340,7 @@ fun AddEditContactScreen(
                 Field(
                     nostr, { nostr = it }, "Nostr (npub, or search by name)",
                     leading = Icons.Filled.AlternateEmail,
-                    modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryEditable),
+                    modifier = Modifier.menuAnchor(ExposedDropdownMenuAnchorType.PrimaryEditable),
                 )
                 ExposedDropdownMenu(
                     expanded = resultsOpen,
