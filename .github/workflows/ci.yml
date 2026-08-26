@@ -1,0 +1,152 @@
+name: Android CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Android build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+
+      - name: Lint, test, and build
+        run: ./gradlew --no-daemon lintDebug testDebugUnitTest assembleDebug assembleRelease
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hessible-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+  release:
+    name: Publish signed release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be a SemVer tag such as v0.1.0" >&2
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Release tag must point to a commit already merged into main" >&2
+            exit 1
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@748248ddd2a24f49513d8f472f81c3a07d4d50e1 # v4.4.4
+
+      - name: Build and verify signed APK
+        shell: bash
+        env:
+          HESSIBLE_KEYSTORE_BASE64: ${{ secrets.HESSIBLE_KEYSTORE_BASE64 }}
+          HESSIBLE_KEYSTORE_PASSWORD: ${{ secrets.HESSIBLE_KEYSTORE_PASSWORD }}
+          HESSIBLE_KEY_ALIAS: ${{ secrets.HESSIBLE_KEY_ALIAS }}
+          HESSIBLE_KEY_PASSWORD: ${{ secrets.HESSIBLE_KEY_PASSWORD }}
+          EXPECTED_CERT_SHA256: ec82be84ea621f014b9ede7ee5b6afd23b0395ef1cfa80fe3fbe39ca88b875e2
+        run: |
+          set -euo pipefail
+          : "${HESSIBLE_KEYSTORE_BASE64:?HESSIBLE_KEYSTORE_BASE64 is required}"
+          : "${HESSIBLE_KEYSTORE_PASSWORD:?HESSIBLE_KEYSTORE_PASSWORD is required}"
+          : "${HESSIBLE_KEY_ALIAS:?HESSIBLE_KEY_ALIAS is required}"
+          : "${HESSIBLE_KEY_PASSWORD:?HESSIBLE_KEY_PASSWORD is required}"
+
+          keystore="$RUNNER_TEMP/hessible-release.jks"
+          release_dir="$RUNNER_TEMP/hessible-release"
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$HESSIBLE_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+
+          export HESSIBLE_KEYSTORE_FILE="$keystore"
+          export HESSIBLE_VERSION_NAME="${GITHUB_REF_NAME#v}"
+          ./gradlew --no-daemon assembleRelease
+
+          source_apk="app/build/outputs/apk/release/app-release.apk"
+          mkdir -p "$release_dir"
+          apk="$release_dir/hessible-${GITHUB_REF_NAME}.apk"
+          cp "$source_apk" "$apk"
+
+          build_tools_dir="$(find "$ANDROID_SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          verify_output="$("$build_tools_dir/apksigner" verify --verbose --print-certs "$apk")"
+          printf '%s\n' "$verify_output"
+          certificate_sha256="$(printf '%s\n' "$verify_output" | awk -F': ' '/certificate SHA-256 digest/ { print $NF; exit }')"
+          if [[ -z "$certificate_sha256" || "${certificate_sha256,,}" != "$EXPECTED_CERT_SHA256" ]]; then
+            echo "Unexpected release signing certificate: $certificate_sha256" >&2
+            exit 1
+          fi
+
+          apkanalyzer="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
+          test "$("$apkanalyzer" manifest application-id "$apk")" = "com.circumspace.contactstr"
+          test "$("$apkanalyzer" manifest version-name "$apk")" = "${GITHUB_REF_NAME#v}"
+          test "$("$apkanalyzer" manifest version-code "$apk")" = "1"
+
+          checksum="$(sha256sum "$apk" | cut -d ' ' -f 1)"
+          printf '%s  %s\n' "$checksum" "$(basename "$apk")" > "$apk.sha256"
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hessible-${{ github.ref_name }}
+          path: |
+            ${{ runner.temp }}/hessible-release/hessible-${{ github.ref_name }}.apk
+            ${{ runner.temp }}/hessible-release/hessible-${{ github.ref_name }}.apk.sha256
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "$RUNNER_TEMP/hessible-release/hessible-${GITHUB_REF_NAME}.apk" \
+            "$RUNNER_TEMP/hessible-release/hessible-${GITHUB_REF_NAME}.apk.sha256" \
+            --verify-tag \
+            --notes-file RELEASE_NOTES.md \
+            --title "Hessible $GITHUB_REF_NAME"

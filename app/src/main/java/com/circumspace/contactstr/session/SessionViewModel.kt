@@ -5,6 +5,7 @@ import android.accounts.AccountManager
 import android.app.Application
 import android.content.Intent
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import com.circumspace.contactstr.crypto.NostrIdentity
 import com.circumspace.contactstr.data.persistence.KeyVault
 import com.circumspace.contactstr.sync.ContactsContractHelper
@@ -15,6 +16,8 @@ import com.vitorpamplona.quartz.nip55AndroidSigner.client.NostrSignerExternal
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * Holds the signed-in Nostr identity (local nsec or external Amber/NIP-55), persisted via
@@ -25,11 +28,16 @@ class SessionViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _identity = MutableStateFlow<NostrIdentity?>(null)
     val identity: StateFlow<NostrIdentity?> = _identity.asStateFlow()
+    private val _restored = MutableStateFlow(false)
+    val restored: StateFlow<Boolean> = _restored.asStateFlow()
 
     init {
-        restore(vault.load())?.also { identity ->
-            ensureAccount(identity.pubKeyHex)
-            _identity.value = identity
+        viewModelScope.launch(Dispatchers.IO) {
+            restore(vault.load())?.also { identity ->
+                ensureAccount(identity.pubKeyHex)
+                _identity.value = identity
+            }
+            _restored.value = true
         }
     }
 

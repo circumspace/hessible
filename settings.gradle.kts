@@ -20,5 +20,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "contactstr"
+rootProject.name = "hessible"
 include(":app")

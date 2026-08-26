@@ -15,7 +15,24 @@ android {
         minSdk = 26
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = providers.environmentVariable("HESSIBLE_VERSION_NAME")
+            .orNull ?: "0.1.0"
+    }
+
+    val signingProperties = providers.environmentVariable("HESSIBLE_KEYSTORE_FILE")
+        .zip(providers.environmentVariable("HESSIBLE_KEYSTORE_PASSWORD")) { file, password -> file to password }
+        .zip(providers.environmentVariable("HESSIBLE_KEY_ALIAS")) { (file, password), alias -> Triple(file, password, alias) }
+        .zip(providers.environmentVariable("HESSIBLE_KEY_PASSWORD")) { (file, password, alias), keyPassword ->
+            arrayOf(file, password, alias, keyPassword)
+        }
+    if (signingProperties.isPresent) {
+        signingConfigs.create("release") {
+            val (file, password, alias, keyPassword) = signingProperties.get()
+            storeFile = rootProject.file(file)
+            storePassword = password
+            keyAlias = alias
+            this.keyPassword = keyPassword
+        }
     }
 
     buildTypes {
@@ -25,9 +42,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
-            // Sign release with the debug key so it's installable for performance testing.
-            // (Replace with a real release keystore before publishing.)
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

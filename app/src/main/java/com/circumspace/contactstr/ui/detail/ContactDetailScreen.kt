@@ -79,6 +79,8 @@ import com.circumspace.contactstr.util.openNostr
 import com.circumspace.contactstr.util.openWebsite
 import com.circumspace.contactstr.util.sendEmail
 import com.circumspace.contactstr.util.sendSms
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -100,6 +102,8 @@ fun ContactDetailScreen(
 
     val context = LocalContext.current
     var showQr by remember { mutableStateOf(false) }
+    var qr by remember(contact) { mutableStateOf<android.graphics.Bitmap?>(null) }
+    var qrLoading by remember(contact) { mutableStateOf(false) }
 
     // Enrich from the linked Nostr profile (non-destructive: fills gaps like the avatar).
     LaunchedEffect(contact.nostr) {
@@ -107,6 +111,23 @@ fun ContactDetailScreen(
     }
     val profileCache by profiles.cache.collectAsStateWithLifecycle()
     val profile = if (contact.nostr.isNotBlank()) profiles.lookup(profileCache, contact.nostr) else null
+
+    LaunchedEffect(showQr, contact) {
+        if (showQr && qr == null) {
+            qrLoading = true
+            qr = withContext(Dispatchers.Default) {
+                runCatching {
+                    BarcodeEncoder().encodeBitmap(
+                        VCardIo.export(listOf(contact)),
+                        BarcodeFormat.QR_CODE,
+                        720,
+                        720,
+                    )
+                }.getOrNull()
+            }
+            qrLoading = false
+        }
+    }
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
@@ -260,23 +281,16 @@ fun ContactDetailScreen(
 
     if (showQr) {
         // Standard vCard payload, so any contacts app (not just Hessible) can scan it.
-        val qr = remember(contact) {
-            runCatching {
-                BarcodeEncoder().encodeBitmap(
-                    VCardIo.export(listOf(contact)),
-                    BarcodeFormat.QR_CODE,
-                    720,
-                    720,
-                )
-            }.getOrNull()
-        }
         AlertDialog(
             onDismissRequest = { showQr = false },
             title = { Text(contact.displayName) },
             text = {
-                if (qr != null) {
+                val qrBitmap = qr
+                if (qrLoading) {
+                    androidx.compose.material3.CircularProgressIndicator()
+                } else if (qrBitmap != null) {
                     Image(
-                        bitmap = qr.asImageBitmap(),
+                        bitmap = qrBitmap.asImageBitmap(),
                         contentDescription = "Contact QR code",
                         modifier = Modifier.fillMaxWidth(),
                     )

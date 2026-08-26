@@ -52,6 +52,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -71,6 +73,10 @@ import com.circumspace.contactstr.data.VCardIo
 import com.circumspace.contactstr.data.nostr.SyncState
 import com.circumspace.contactstr.domain.Contact
 import com.circumspace.contactstr.ui.common.IdentityAvatar
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -88,7 +94,7 @@ fun SettingsScreen(
     onDetectLocalRelay: () -> Unit,
     onAddBlossomServer: (String) -> Unit,
     onRemoveBlossomServer: (String) -> Unit,
-    onImport: (List<Contact>) -> Unit,
+    onImport: suspend (List<Contact>) -> Int,
     onSignOut: () -> Unit,
     onWipeAndSignOut: () -> Unit,
     onBack: () -> Unit,
@@ -97,21 +103,29 @@ fun SettingsScreen(
     val context = LocalContext.current
     var showWipeConfirm by remember { mutableStateOf(false) }
     var showPasteDialog by remember { mutableStateOf(false) }
+    var transferInProgress by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     val exporter = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/x-vcard"),
     ) { uri ->
         if (uri != null) {
-            val ok = runCatching {
-                context.contentResolver.openOutputStream(uri)?.use {
-                    it.write(VCardIo.export(contacts).toByteArray())
+            scope.launch {
+                transferInProgress = true
+                val ok = withContext(Dispatchers.IO) {
+                    runCatching {
+                        context.contentResolver.openOutputStream(uri)?.use {
+                            it.write(VCardIo.export(contacts).toByteArray())
+                        }
+                    }.isSuccess
                 }
-            }.isSuccess
-            Toast.makeText(
-                context,
-                if (ok) "Exported ${contacts.size} contacts" else "Export failed",
-                Toast.LENGTH_SHORT,
-            ).show()
+                transferInProgress = false
+                Toast.makeText(
+                    context,
+                    if (ok) "Exported ${contacts.size} contacts" else "Export failed",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
         }
     }
 
@@ -119,11 +133,17 @@ fun SettingsScreen(
         ActivityResultContracts.OpenDocument(),
     ) { uri ->
         if (uri != null) {
-            val imported = runCatching {
-                context.contentResolver.openInputStream(uri)?.use { VCardIo.parse(it) }
-            }.getOrNull().orEmpty()
-            onImport(imported)
-            Toast.makeText(context, "Imported ${imported.size} contacts", Toast.LENGTH_SHORT).show()
+            scope.launch {
+                transferInProgress = true
+                val imported = withContext(Dispatchers.IO) {
+                    runCatching {
+                        context.contentResolver.openInputStream(uri)?.use { VCardIo.parse(it) }
+                    }.getOrNull().orEmpty()
+                }
+                val count = onImport(imported)
+                transferInProgress = false
+                Toast.makeText(context, "Imported $count contacts", Toast.LENGTH_SHORT).show()
+            }
         }
     }
     Scaffold(
@@ -202,7 +222,7 @@ fun SettingsScreen(
                     OutlinedButton(
                         onClick = { exporter.launch("contactstr.vcf") },
                         modifier = Modifier.weight(1f),
-                        enabled = contacts.isNotEmpty(),
+                        enabled = contacts.isNotEmpty() && !transferInProgress,
                     ) {
                         Icon(Icons.Filled.Upload, contentDescription = null)
                         Text("  Export")
@@ -212,12 +232,17 @@ fun SettingsScreen(
                             importer.launch(arrayOf("text/x-vcard", "text/vcard", "text/directory", "text/plain", "*/*"))
                         },
                         modifier = Modifier.weight(1f),
+                        enabled = !transferInProgress,
                     ) {
                         Icon(Icons.Filled.Download, contentDescription = null)
                         Text("  Import")
                     }
                 }
-                OutlinedButton(onClick = { showPasteDialog = true }, modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { showPasteDialog = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !transferInProgress,
+                ) {
                     Icon(Icons.Filled.ContentPaste, contentDescription = null)
                     Text("  Paste contacts")
                 }
@@ -283,9 +308,9 @@ fun SettingsScreen(
     if (showPasteDialog) {
         PasteImportDialog(
             existingNames = contacts.map { it.displayName.trim().lowercase() }.toSet(),
-            onImport = { imported ->
-                onImport(imported)
-                Toast.makeText(context, "Imported ${imported.size} contacts", Toast.LENGTH_SHORT).show()
+            onImport = onImport,
+            onImported = { count ->
+                Toast.makeText(context, "Imported $count contacts", Toast.LENGTH_SHORT).show()
                 showPasteDialog = false
             },
             onDismiss = { showPasteDialog = false },
@@ -300,13 +325,20 @@ fun SettingsScreen(
 @Composable
 private fun PasteImportDialog(
     existingNames: Set<String>,
-    onImport: (List<Contact>) -> Unit,
+    onImport: suspend (List<Contact>) -> Int,
+    onImported: (Int) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val clipboard = LocalClipboardManager.current
     var text by remember { mutableStateOf(clipboard.getText()?.text ?: "") }
+    var importing by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
-    val parsed = remember(text) { PasteImport.parse(text) }
+    val parsedResult by produceState("" to emptyList<PasteImport.ParsedLine>(), text) {
+        delay(250)
+        value = text to withContext(Dispatchers.Default) { PasteImport.parse(text) }
+    }
+    val parsed = parsedResult.second.takeIf { parsedResult.first == text }.orEmpty()
     val importable = remember(parsed) {
         parsed.mapNotNull { it.contact }
             .filterNot { it.displayName.trim().lowercase() in existingNames }
@@ -365,8 +397,18 @@ private fun PasteImportDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = { onImport(importable) }, enabled = importable.isNotEmpty()) {
-                Text("Import ${importable.size}")
+            TextButton(
+                onClick = {
+                    scope.launch {
+                        importing = true
+                        val count = onImport(importable)
+                        importing = false
+                        onImported(count)
+                    }
+                },
+                enabled = importable.isNotEmpty() && !importing,
+            ) {
+                Text(if (importing) "Importing..." else "Import ${importable.size}")
             }
         },
         dismissButton = {
