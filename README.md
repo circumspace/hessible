@@ -1,5 +1,15 @@
 # Hessible
 
+<p align="center">
+  <img src="app/src/main/res/drawable-nodpi/app_icon.png" alt="Hessible app icon" width="160">
+</p>
+
+<p align="center">
+  <a href="https://zapstore.dev/apps/com.circumspace.contactstr">
+    <img src="https://zapstore.dev/images/get-it-on-zapstore.svg" alt="Get it on Zapstore" height="56">
+  </a>
+</p>
+
 A privacy-first Android contacts app. Your contacts are encrypted end-to-end and stored on
 Nostr relays — readable only with your key, syncable across devices, with no central server.
 
