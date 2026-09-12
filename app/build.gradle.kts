@@ -14,9 +14,9 @@ android {
         applicationId = "com.circumspace.contactstr"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
+        versionCode = 2
         versionName = providers.environmentVariable("HESSIBLE_VERSION_NAME")
-            .orNull ?: "0.1.0"
+            .orNull ?: "0.1.1"
     }
 
     val signingProperties = providers.environmentVariable("HESSIBLE_KEYSTORE_FILE")

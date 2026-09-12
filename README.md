@@ -60,6 +60,11 @@ The release job verifies the APK package, version, and signing certificate befor
 Release signing certificate SHA-256:
 `EC:82:BE:84:EA:62:1F:01:4B:9E:DE:7E:E5:B6:AF:D2:3B:03:95:EF:1C:FA:80:FE:3F:BE:39:CA:88:B8:75:E2`.
 
+## App icon
+
+Editable artwork and Android, macOS, and Linux exports live in
+[branding/icons](branding/icons/README.md). See the [platform preview](branding/icons/preview.png).
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE). Copyright © hermeticvm.

@@ -126,7 +126,7 @@ jobs:
           apkanalyzer="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/apkanalyzer"
           test "$("$apkanalyzer" manifest application-id "$apk")" = "com.circumspace.contactstr"
           test "$("$apkanalyzer" manifest version-name "$apk")" = "${GITHUB_REF_NAME#v}"
-          test "$("$apkanalyzer" manifest version-code "$apk")" = "1"
+          test "$("$apkanalyzer" manifest version-code "$apk")" = "2"
 
           checksum="$(sha256sum "$apk" | cut -d ' ' -f 1)"
           printf '%s  %s\n' "$checksum" "$(basename "$apk")" > "$apk.sha256"
