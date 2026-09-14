@@ -1,5 +1,5 @@
 Hessible 0.1.2 is a size, speed, and reliability update. There are no new screens — the app is
-smaller, starts on better relays, and mirrors and syncs contacts with less work.
+smaller and mirrors and syncs contacts with less work.
 
 ### Highlights
 
@@ -7,9 +7,6 @@ smaller, starts on better relays, and mirrors and syncs contacts with less work.
   from roughly 32 MB to roughly 20 MB.
 - **Faster startup and sync:** contact list updates, system-contacts mirroring, and at-rest key
   access are all cheaper, so large address books sync with noticeably less overhead.
-- **Better default relays:** a fresh install now starts with `relay.damus.io`, Yakihonne
-  (`nostr-01.yakihonne.com`), and the project's home relay. Relays that prune old data or have
-  gone offline are no longer in the default line-up.
 - **Encrypted photo storage defaults:** contact photos upload to `blossom.circum.space` first, with
   `blossom.band` as a fallback, and the encrypted copy is mirrored for redundancy.
 
