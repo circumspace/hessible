@@ -1,21 +1,22 @@
-Hessible 0.1.1 introduces a new visual identity built around two interwoven ribbons forming an H.
+Hessible 0.1.2 is a size, speed, and reliability update. There are no new screens — the app is
+smaller, starts on better relays, and mirrors and syncs contacts with less work.
 
 ### Highlights
 
-- **New launcher icon:** a distinct coral, amber, and purple H replaces the original amphora design.
-- **Native adaptive artwork:** Android 8.0 and newer receive separate foreground and background
-  layers that remain correctly framed across launcher icon shapes.
-- **Themed icon support:** Android 13 and newer can use a monochrome version of the same mark when
-  themed icons are enabled.
-- **Consistent branding:** the About screen, repository README, and Play Store export use artwork
-  generated from the same editable vector source.
-- **Reusable source assets:** editable SVG artwork and generated Android, macOS, and Linux exports
-  are included under `branding/icons`.
+- **Much smaller download:** the release build is now minified and resource-shrunk, cutting the APK
+  from roughly 32 MB to roughly 20 MB.
+- **Faster startup and sync:** contact list updates, system-contacts mirroring, and at-rest key
+  access are all cheaper, so large address books sync with noticeably less overhead.
+- **Better default relays:** a fresh install now starts with `relay.damus.io`, Yakihonne
+  (`nostr-01.yakihonne.com`), and the project's home relay. Relays that prune old data or have
+  gone offline are no longer in the default line-up.
+- **Encrypted photo storage defaults:** contact photos upload to `blossom.circum.space` first, with
+  `blossom.band` as a fallback, and the encrypted copy is mirrored for redundancy.
 
 ### Install
 
-Download `hessible-v0.1.1.apk` below and install it on Android 8.0 or newer. It can be installed as
-an update over Hessible 0.1.0 without removing app data. Android may ask you to allow installs from
+Download `hessible-v0.1.2.apk` below and install it on Android 8.0 or newer. It installs as an
+update over Hessible 0.1.1 without removing app data. Android may ask you to allow installs from
 the browser or file manager you used to open the APK. The accompanying `.sha256` file can be used
 to verify the download.
 
@@ -26,6 +27,8 @@ Release signing certificate SHA-256:
 
 - This is an early preview. Back up your Nostr secret key before relying on Hessible as your only
   copy of important contacts.
+- The new relay and Blossom defaults apply to fresh installs. Existing relay and photo-server
+  settings are preserved across the update.
 - Relay availability and retention policies vary. Configure multiple relays, including a durable
   paid, self-hosted, or on-device relay when possible.
 - Nostr deletion requests are advisory. Hessible remembers tombstones locally to hide stale copies,

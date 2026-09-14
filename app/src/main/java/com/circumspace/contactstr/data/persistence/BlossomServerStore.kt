@@ -35,8 +35,8 @@ class BlossomServerStore(private val context: Context) {
          * these are commonly open, and the user can add/remove their own in Settings.
          */
         val DEFAULTS = listOf(
+            "https://blossom.circum.space",
             "https://blossom.band",
-            "https://blossom.primal.net",
         )
     }
 }

@@ -39,15 +39,19 @@ Nostr relays — readable only with your key, syncable across devices, with no c
 
 ## Build
 
-Requires Android Studio with a recent AGP/Kotlin toolchain.
+Requires Android Studio with a recent AGP/Kotlin toolchain. Builds are production-only — the debug
+variant is disabled, so `assemble`/`install` always target the signed release build.
 
 ```sh
-./gradlew assembleDebug
+./gradlew assembleRelease
 ```
+
+Release signing is read from the `HESSIBLE_KEYSTORE_FILE`, `HESSIBLE_KEYSTORE_PASSWORD`,
+`HESSIBLE_KEY_ALIAS`, and `HESSIBLE_KEY_PASSWORD` environment variables (the same ones CI uses).
 
 ## CI and releases
 
-GitHub Actions runs lint, unit tests, and debug/release builds for pushes and pull requests. A
+GitHub Actions runs lint, unit tests, and a release build for pushes and pull requests. A
 SemVer tag matching `v*` creates a native GitHub release from a commit already merged into `main`,
 using the curated notes in `RELEASE_NOTES.md`. Release tags require these repository secrets:
 

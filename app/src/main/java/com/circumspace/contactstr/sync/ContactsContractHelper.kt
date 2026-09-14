@@ -109,12 +109,27 @@ class ContactsContractHelper(private val context: Context) {
      */
     fun fullSync(account: Account, contacts: List<Contact>) = guard {
         val incoming = contacts.associateBy { it.id }
-        fetchRawStats(account).forEach { (sourceId, stat) ->
+        // One scan of this account's raw contacts feeds both the orphan/duplicate purge and the
+        // per-contact upsert below, instead of a separate findRawContact query for every contact.
+        val stats = fetchRawStats(account)
+        val purged = HashSet<String>()
+        stats.forEach { (sourceId, stat) ->
             if (sourceId !in incoming || stat.count > 1 || stat.anyDeleted) {
                 deleteRawContactsBySource(account, sourceId)
+                purged += sourceId
             }
         }
-        contacts.forEach { upsert(account, it) }
+        contacts.forEach { contact ->
+            val stat = stats[contact.id]
+            val fp = fingerprint(contact)
+            when {
+                stat == null || contact.id in purged -> insert(account, contact, fp)
+                // Fingerprint matches what we last wrote — nothing to do.
+                stat.sync1 == fp -> Unit
+                stat.liveId != null -> update(stat.liveId, contact, fp)
+                else -> insert(account, contact, fp)
+            }
+        }
     }
 
     /**
@@ -149,13 +164,19 @@ class ContactsContractHelper(private val context: Context) {
         }
     }
 
-    private data class RawStat(val count: Int, val anyDeleted: Boolean)
+    private data class RawStat(
+        val count: Int,
+        val anyDeleted: Boolean,
+        /** _ID and SYNC1 of the first *live* row, reused by [fullSync] to skip a per-contact query. */
+        val liveId: Long?,
+        val sync1: String?,
+    )
 
-    /** sourceId → (row count, whether any row is soft-deleted) for this account, across all states. */
+    /** sourceId → (row count, whether any row is soft-deleted, live row id + fingerprint). */
     private fun fetchRawStats(account: Account): Map<String, RawStat> {
         val cursor: Cursor = resolver.query(
             RawContacts.CONTENT_URI,
-            arrayOf(RawContacts.SOURCE_ID, RawContacts.DELETED),
+            arrayOf(RawContacts.SOURCE_ID, RawContacts.DELETED, RawContacts._ID, RawContacts.SYNC1),
             "${RawContacts.ACCOUNT_TYPE}=? AND ${RawContacts.ACCOUNT_NAME}=?",
             arrayOf(ACCOUNT_TYPE, account.name),
             null,
@@ -166,7 +187,17 @@ class ContactsContractHelper(private val context: Context) {
                 val sourceId = it.getString(0) ?: continue
                 val deleted = it.getInt(1) == 1
                 val prev = map[sourceId]
-                map[sourceId] = RawStat((prev?.count ?: 0) + 1, (prev?.anyDeleted ?: false) || deleted)
+                val liveId = when {
+                    deleted -> prev?.liveId
+                    prev?.liveId != null -> prev.liveId
+                    else -> it.getLong(2)
+                }
+                map[sourceId] = RawStat(
+                    count = (prev?.count ?: 0) + 1,
+                    anyDeleted = (prev?.anyDeleted ?: false) || deleted,
+                    liveId = liveId,
+                    sync1 = if (!deleted && prev?.liveId == null) it.getString(3) else prev?.sync1,
+                )
             }
             map
         }

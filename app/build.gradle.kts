@@ -14,9 +14,9 @@ android {
         applicationId = "com.circumspace.contactstr"
         minSdk = 26
         targetSdk = 36
-        versionCode = 2
+        versionCode = 3
         versionName = providers.environmentVariable("HESSIBLE_VERSION_NAME")
-            .orNull ?: "0.1.1"
+            .orNull ?: "0.1.2"
     }
 
     val signingProperties = providers.environmentVariable("HESSIBLE_KEYSTORE_FILE")
@@ -37,7 +37,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
@@ -54,6 +55,16 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // No debug variant exists, so run unit tests against the release variant.
+    testBuildType = "release"
+}
+
+// Production-only builds: the debug variant is disabled, so every assemble/install/test task
+// targets the signed release build. A debug APK would otherwise share the same applicationId
+// (`com.circumspace.contactstr`) while being signed with a different key, which breaks updates.
+androidComponents {
+    beforeVariants(selector().withBuildType("debug")) { it.enable = false }
 }
 
 // AGP 9 built-in Kotlin: configure the Kotlin toolchain via the top-level kotlin {} extension.
@@ -78,7 +89,6 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
     implementation(libs.androidx.material.icons.extended)
-    debugImplementation(libs.androidx.ui.tooling)
 
     // Nostr: keys, NIP-19 (npub/nsec), NIP-44 encryption, signers.
     implementation(libs.quartz)

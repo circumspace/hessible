@@ -21,7 +21,22 @@ object SecureBlob {
     private const val IV_LENGTH = 12
     private const val TAG_BITS = 128
 
+    /**
+     * The Keystore key handle is expensive to re-resolve (`KeyStore.load` + `getEntry`), and
+     * seal/open run for every persisted blob (identity, contacts, outbox, relays, tombstones).
+     * Cache it for the process lifetime; the key material itself never leaves the Keystore.
+     */
+    @Volatile
+    private var cachedKey: SecretKey? = null
+
     private fun secretKey(): SecretKey {
+        cachedKey?.let { return it }
+        return synchronized(this) {
+            cachedKey ?: loadOrCreateKey().also { cachedKey = it }
+        }
+    }
+
+    private fun loadOrCreateKey(): SecretKey {
         val ks = KeyStore.getInstance(PROVIDER).apply { load(null) }
         (ks.getEntry(ALIAS, null) as? KeyStore.SecretKeyEntry)?.let { return it.secretKey }
 

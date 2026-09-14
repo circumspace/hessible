@@ -15,8 +15,7 @@ package com.circumspace.contactstr.data
 /** Read/write the user's own encrypted contact events. Shown read-only in the Settings sync panel. */
 val DATA_RELAYS: List<String> = listOf(
     "wss://relay.damus.io",
-    "wss://nos.lol",
-    "wss://relay.primal.net",
+    "wss://nostr-01.yakihonne.com",
     "wss://nostrelay.circum.space",
 )
 
@@ -39,7 +38,6 @@ val SEARCH_RELAYS: List<String> = listOf(
 val PROFILE_RELAYS: List<String> = listOf(
     "wss://purplepag.es",
     "wss://relay.damus.io",
-    "wss://relay.primal.net",
     "wss://nos.lol",
     // The app's home relay — where contactstr users publish, so it hosts profiles the big
     // aggregators may not have yet. Keep it in the profile-read set.

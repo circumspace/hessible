@@ -483,9 +483,22 @@ class ContactsViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun merge(list: List<Contact>, contact: Contact): List<Contact> {
-        val idx = list.indexOfFirst { it.id == contact.id }
-        val merged = if (idx >= 0) list.toMutableList().also { it[idx] = contact } else list + contact
-        return merged.sortedBy { it.displayName.lowercase() }
+        // Drop any existing copy, then binary-search the sorted position and insert — instead of
+        // re-sorting the whole list (and lowercasing every name) on each relay event. A startup
+        // sync replays hundreds of contacts one at a time, which made a full sort per event
+        // quadratic.
+        val result = list.toMutableList()
+        val existing = result.indexOfFirst { it.id == contact.id }
+        if (existing >= 0) result.removeAt(existing)
+        val key = contact.displayName.lowercase()
+        var lo = 0
+        var hi = result.size
+        while (lo < hi) {
+            val mid = (lo + hi) ushr 1
+            if (result[mid].displayName.lowercase() <= key) lo = mid + 1 else hi = mid
+        }
+        result.add(lo, contact)
+        return result
     }
 
     private fun mergeAll(list: List<Contact>, contacts: List<Contact>): List<Contact> {
